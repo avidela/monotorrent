@@ -29,63 +29,72 @@
 
 using System;
 using System.Collections.Generic;
-using System.Text;
-using MonoTorrent.Client;
-using MonoTorrent.Common;
-using MonoTorrent.Client.Messages;
 
-namespace MonoTorrent.Client
+namespace MonoTorrent.Client.PiecePicking
 {
     class TestPicker : PiecePicker
     {
-        public List<BitField> IsInterestingBitfield = new List<BitField>();
-        public List<PeerId> PickPieceId = new List<PeerId>();
-        public List<BitField> PickPieceBitfield = new List<BitField>();
-        public List<List<PeerId>> PickPiecePeers = new List<List<PeerId>>();
-        public List<int> PickPieceStartIndex = new List<int>();
-        public List<int> PickPieceEndIndex = new List<int>();
-        public List<int> PickPieceCount = new List<int>();
+        public List<BitField> IsInterestingBitfield = new List<BitField> ();
+        public List<IPieceRequester> PickPieceId = new List<IPieceRequester> ();
+        public List<BitField> PickPieceBitfield = new List<BitField> ();
+        public List<IReadOnlyList<IPieceRequester>> PickPiecePeers = new List<IReadOnlyList<IPieceRequester>> ();
+        public List<Tuple<int, int>> PickedIndex = new List<Tuple<int, int>> ();
+        public List<int> PickPieceCount = new List<int> ();
 
-        public List<int> PickedPieces = new List<int>();
+        public List<int> PickedPieces = new List<int> ();
 
         public bool ReturnNoPiece = true;
-        public TestPicker()
-            : base(null)
+
+        public bool HasCancelledRequests { get; set; }
+        public List<IPieceRequester> CancelledRequestsFrom { get; } = new List<IPieceRequester> ();
+
+        public TestPicker ()
+            : base (null)
         {
         }
 
-        public override MessageBundle PickPiece(PeerId id, BitField peerBitfield, List<PeerId> otherPeers, int count, int startIndex, int endIndex)
+        public override void CancelRequests (IPieceRequester peer)
         {
-            PickPieceId.Add(id);
-            BitField clone = new BitField(peerBitfield.Length);
-            clone.Or(peerBitfield);
-            PickPieceBitfield.Add(clone);
-            PickPiecePeers.Add(otherPeers);
-            PickPieceStartIndex.Add(startIndex);
-            PickPieceEndIndex.Add(endIndex);
-            PickPieceCount.Add(count);
+            HasCancelledRequests = true;
+            CancelledRequestsFrom.Add (peer);
+        }
 
-            for (int i = startIndex; i < endIndex; i++)
-            {
-                if (PickedPieces.Contains(i))
+        public override void CancelRequest (IPieceRequester peer, int piece, int startOffset, int length)
+        {
+            HasCancelledRequests = true;
+            CancelledRequestsFrom.Add (peer);
+        }
+
+        public override IList<PieceRequest> PickPiece (IPieceRequester peer, BitField available, IReadOnlyList<IPieceRequester> otherPeers, int count, int startIndex, int endIndex)
+        {
+            PickPieceId.Add (peer);
+            BitField clone = new BitField (available.Length);
+            clone.Or (available);
+            PickPieceBitfield.Add (clone);
+            PickPiecePeers.Add (otherPeers);
+            PickedIndex.Add (Tuple.Create (startIndex, endIndex));
+            PickPieceCount.Add (count);
+
+            for (int i = startIndex; i < endIndex; i++) {
+                if (PickedPieces.Contains (i))
                     continue;
-                PickedPieces.Add(i);
+                PickedPieces.Add (i);
                 if (ReturnNoPiece)
                     return null;
                 else
-                    return new MessageBundle();
+                    return Array.Empty<PieceRequest> ();
             }
             return null;
         }
 
-        public override void Initialise(BitField bitfield, TorrentFile[] files, IEnumerable<Piece> requests)
+        public override void Initialise (BitField bitfield, ITorrentData torrentData, IEnumerable<Piece> requests)
         {
-            
+
         }
 
-        public override bool IsInteresting(BitField bitfield)
+        public override bool IsInteresting (BitField bitfield)
         {
-            IsInterestingBitfield.Add(bitfield);
+            IsInterestingBitfield.Add (bitfield);
             return !bitfield.AllFalse;
         }
     }

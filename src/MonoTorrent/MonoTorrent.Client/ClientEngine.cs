@@ -13,10 +13,10 @@
 // distribute, sublicense, and/or sell copies of the Software, and to
 // permit persons to whom the Software is furnished to do so, subject to
 // the following conditions:
-// 
+//
 // The above copyright notice and this permission notice shall be
 // included in all copies or substantial portions of the Software.
-// 
+//
 // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
 // EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
 // MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
@@ -27,19 +27,23 @@
 //
 
 
-
 using System;
 using System.Collections.Generic;
-using System.Text;
-using System.Net.Sockets;
-using System.Net;
-using System.IO;
-using System.Threading;
-using MonoTorrent.Client.Encryption;
-using MonoTorrent.Common;
-using MonoTorrent.Client.Tracker;
-using MonoTorrent.Client.PieceWriters;
 using System.Collections.ObjectModel;
+using System.ComponentModel;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+
+using MonoTorrent.BEncoding;
+using MonoTorrent.Client.Listeners;
+using MonoTorrent.Client.PieceWriters;
+using MonoTorrent.Client.PortForwarding;
+using MonoTorrent.Client.RateLimiters;
+using MonoTorrent.Dht;
 
 namespace MonoTorrent.Client
 {
@@ -48,27 +52,27 @@ namespace MonoTorrent.Client
     /// </summary>
     public class ClientEngine : IDisposable
     {
-        internal static MainLoop MainLoop = new MainLoop("Client Engine Loop");
-        private static Random random = new Random();
+        internal static readonly MainLoop MainLoop = new MainLoop ("Client Engine Loop");
+
+        /// <summary>
+        /// An un-seeded random number generator which will not generate the same
+        /// random sequence when the application is restarted.
+        /// </summary>
+        static readonly Random PeerIdRandomGenerator = new Random ();
         #region Global Constants
 
-        // To support this I need to ensure that the transition from
-        // InitialSeeding -> Regular seeding either closes all existing
-        // connections or sends HaveAll messages, or sends HaveMessages.
-        public static readonly bool SupportsInitialSeed = true;
+        // This is the number of 16kB requests which can be queued against one peer.
+        internal static readonly int DefaultMaxPendingRequests = 256;
+        public static readonly bool SupportsInitialSeed = false;
         public static readonly bool SupportsLocalPeerDiscovery = true;
         public static readonly bool SupportsWebSeed = true;
         public static readonly bool SupportsExtended = true;
         public static readonly bool SupportsFastPeer = true;
         public static readonly bool SupportsEncryption = true;
         public static readonly bool SupportsEndgameMode = true;
-#if !DISABLE_DHT
         public static readonly bool SupportsDht = true;
-#else
-        public static readonly bool SupportsDht = false;
-#endif
         internal const int TickLength = 500;    // A logic tick will be performed every TickLength miliseconds
-       
+
         #endregion
 
 
@@ -77,94 +81,84 @@ namespace MonoTorrent.Client
         public event EventHandler<StatsUpdateEventArgs> StatsUpdate;
         public event EventHandler<CriticalExceptionEventArgs> CriticalException;
 
-        public event EventHandler<TorrentEventArgs> TorrentRegistered;
-        public event EventHandler<TorrentEventArgs> TorrentUnregistered;
-
         #endregion
 
 
         #region Member Variables
 
-        internal static readonly BufferManager BufferManager = new BufferManager();
-        private ConnectionManager connectionManager;
-        
-        private IDhtEngine dhtEngine;
-        private DiskManager diskManager;
-        private bool disposed;
-        private bool isRunning;
-        private PeerListener listener;
-        private ListenManager listenManager;         // Listens for incoming connections and passes them off to the correct TorrentManager
-        private LocalPeerManager localPeerManager;
-        private LocalPeerListener localPeerListener;
-        private readonly string peerId;
-        private EngineSettings settings;
-        private int tickCount;
-        private List<TorrentManager> torrents;
-        private ReadOnlyCollection<TorrentManager> torrentsReadonly;
-        private RateLimiterGroup uploadLimiter;
-        private RateLimiterGroup downloadLimiter;
+        readonly ListenManager listenManager;         // Listens for incoming connections and passes them off to the correct TorrentManager
+        int tickCount;
+        /// <summary>
+        /// The <see cref="TorrentManager"/> instances registered by the user.
+        /// </summary>
+        readonly List<TorrentManager> publicTorrents;
+
+        /// <summary>
+        /// The <see cref="TorrentManager"/> instances registered by the user and the instances
+        /// implicitly created by <see cref="DownloadMetadataAsync(MagnetLink, CancellationToken)"/>.
+        /// </summary>
+        readonly List<TorrentManager> allTorrents;
+
+        readonly RateLimiter uploadLimiter;
+        readonly RateLimiterGroup uploadLimiters;
+        readonly RateLimiter downloadLimiter;
+        readonly RateLimiterGroup downloadLimiters;
 
         #endregion
 
 
         #region Properties
 
-        public ConnectionManager ConnectionManager
-        {
-            get { return this.connectionManager; }
-        }
+        public ConnectionManager ConnectionManager { get; }
 
-#if !DISABLE_DHT
-        public IDhtEngine DhtEngine
-        {
-            get { return dhtEngine; }
-        }
-#endif
-        public DiskManager DiskManager
-        {
-            get { return diskManager; }
-        }
+        public IDhtEngine DhtEngine { get; private set; }
 
-        public bool Disposed
-        {
-            get { return disposed; }
-        }
+        public DiskManager DiskManager { get; }
 
-        public PeerListener Listener
-        {
-            get { return this.listener; }
-        }
+        public bool Disposed { get; private set; }
 
-        public bool LocalPeerSearchEnabled
-        {
-            get { return localPeerListener.Status != ListenerStatus.NotListening; }
-            set
-            {
-                if (value && !LocalPeerSearchEnabled)
-                    localPeerListener.Start();
-                else if (!value && LocalPeerSearchEnabled)
-                    localPeerListener.Stop();
+        /// <summary>
+        /// Returns true when <see cref="EnablePortForwardingAsync"/> is invoked. When enabled, the
+        /// engine will automatically forward ports using uPnP and/or NAT-PMP compatible routers.
+        /// </summary>
+        public bool PortForwardingEnabled => PortForwarder.Active;
+
+        public IPeerListener Listener { get; }
+
+        public ILocalPeerDiscovery LocalPeerDiscovery { get; private set; }
+
+        /// <summary>
+        /// When <see cref="PortForwardingEnabled"/> is set to true, this will return a representation
+        /// of the ports the engine is managing.
+        /// </summary>
+        public Mappings PortMappings => PortForwardingEnabled ? PortForwarder.Mappings : Mappings.Empty;
+
+        public bool IsRunning { get; private set; }
+
+        public BEncodedString PeerId { get; }
+
+        internal IPortForwarder PortForwarder { get; }
+
+        public EngineSettings Settings { get; }
+
+        public IList<TorrentManager> Torrents { get; }
+
+        public long TotalDownloadSpeed {
+            get {
+                long total = 0;
+                for (int i = 0; i < publicTorrents.Count; i++)
+                    total += publicTorrents[i].Monitor.DownloadSpeed;
+                return total;
             }
         }
 
-        public bool IsRunning
-        {
-            get { return this.isRunning; }
-        }
-
-        public string PeerId
-        {
-            get { return peerId; }
-        }
-
-        public EngineSettings Settings
-        {
-            get { return this.settings; }
-        }
-
-        public IList<TorrentManager> Torrents
-        {
-            get { return torrentsReadonly; }
+        public long TotalUploadSpeed {
+            get {
+                long total = 0;
+                for (int i = 0; i < publicTorrents.Count; i++)
+                    total += publicTorrents[i].Monitor.UploadSpeed;
+                return total;
+            }
         }
 
         #endregion
@@ -172,74 +166,76 @@ namespace MonoTorrent.Client
 
         #region Constructors
 
-        public ClientEngine(EngineSettings settings)
-            : this (settings, new DiskWriter())
+        public ClientEngine ()
+            : this(new EngineSettings ())
         {
 
         }
 
-        public ClientEngine(EngineSettings settings, PieceWriter writer)
-            : this(settings, new SocketListener(new IPEndPoint(IPAddress.Any, 0)), writer)
+        public ClientEngine (EngineSettings settings)
+            : this (settings, new DiskWriter ())
+        {
+
+        }
+
+        public ClientEngine (EngineSettings settings, IPieceWriter writer)
+            : this (settings, new PeerListener (new IPEndPoint (IPAddress.Any, settings.ListenPort)), writer)
 
         {
 
         }
 
-        public ClientEngine(EngineSettings settings, PeerListener listener)
-            : this (settings, listener, new DiskWriter())
+        public ClientEngine (EngineSettings settings, IPeerListener listener)
+            : this (settings, listener, new DiskWriter ())
         {
 
         }
 
-        public ClientEngine(EngineSettings settings, PeerListener listener, PieceWriter writer)
+        public ClientEngine (EngineSettings settings, IPeerListener listener, IPieceWriter writer)
         {
-            Check.Settings(settings);
-            Check.Listener(listener);
-            Check.Writer(writer);
+            Check.Settings (settings);
+            Check.Listener (listener);
+            Check.Writer (writer);
 
-            this.listener = listener;
-            this.settings = settings;
+            // This is just a sanity check to make sure the ReusableTasks.dll assembly is
+            // loadable.
+            GC.KeepAlive (ReusableTasks.ReusableTask.CompletedTask);
 
-            this.connectionManager = new ConnectionManager(this);
-            RegisterDht (new NullDhtEngine());
-            this.diskManager = new DiskManager(this, writer);
-            this.listenManager = new ListenManager(this);
-            MainLoop.QueueTimeout(TimeSpan.FromMilliseconds(TickLength), delegate {
-                if (IsRunning && !disposed)
-                    LogicTick();
-                return !disposed;
+            PeerId = GeneratePeerId ();
+            Listener = listener ?? throw new ArgumentNullException (nameof (listener));
+            Settings = settings ?? throw new ArgumentNullException (nameof (settings));
+
+            allTorrents = new List<TorrentManager> ();
+            publicTorrents = new List<TorrentManager> ();
+            Torrents = new ReadOnlyCollection<TorrentManager> (publicTorrents);
+
+            DiskManager = new DiskManager (Settings, writer);
+            ConnectionManager = new ConnectionManager (PeerId, Settings, DiskManager);
+            DhtEngine = new NullDhtEngine ();
+            listenManager = new ListenManager (this);
+            PortForwarder = new MonoNatPortForwarder ();
+
+            MainLoop.QueueTimeout (TimeSpan.FromMilliseconds (TickLength), delegate {
+                if (IsRunning && !Disposed)
+                    LogicTick ();
+                return !Disposed;
             });
-            this.torrents = new List<TorrentManager>();
-            this.torrentsReadonly = new ReadOnlyCollection<TorrentManager> (torrents);
-            CreateRateLimiters();
-            this.peerId = GeneratePeerId();
 
-            localPeerListener = new LocalPeerListener(this);
-            localPeerManager = new LocalPeerManager();
-            LocalPeerSearchEnabled = SupportsLocalPeerDiscovery;
-            listenManager.Register(listener);
-            // This means we created the listener in the constructor
-            if (listener.Endpoint.Port == 0)
-                listener.ChangeEndpoint(new IPEndPoint(IPAddress.Any, settings.ListenPort));
-        }
+            downloadLimiter = new RateLimiter ();
+            downloadLimiters = new RateLimiterGroup {
+                new DiskWriterLimiter(DiskManager),
+                downloadLimiter,
+            };
 
-        void CreateRateLimiters()
-        {
-            RateLimiter downloader = new RateLimiter();
-            downloadLimiter = new RateLimiterGroup();
-            downloadLimiter.Add(new DiskWriterLimiter(DiskManager));
-            downloadLimiter.Add(downloader);
+            uploadLimiter = new RateLimiter ();
+            uploadLimiters = new RateLimiterGroup {
+                uploadLimiter
+            };
 
-            RateLimiter uploader = new RateLimiter();
-            uploadLimiter = new RateLimiterGroup();
-            downloadLimiter.Add(new DiskWriterLimiter(DiskManager));
-            uploadLimiter.Add(uploader);
+            listenManager.Register (listener);
 
-            ClientEngine.MainLoop.QueueTimeout(TimeSpan.FromSeconds(1), delegate {
-                downloader.UpdateChunks(Settings.GlobalMaxDownloadSpeed, TotalDownloadSpeed);
-                uploader.UpdateChunks(Settings.GlobalMaxUploadSpeed, TotalUploadSpeed);
-                return !disposed;
-            });
+            if (SupportsLocalPeerDiscovery)
+                RegisterLocalPeerDiscovery (new LocalPeerDiscovery (Settings));
         }
 
         #endregion
@@ -247,205 +243,277 @@ namespace MonoTorrent.Client
 
         #region Methods
 
-        public void ChangeListenEndpoint(IPEndPoint endpoint)
+        void CheckDisposed ()
         {
-            Check.Endpoint(endpoint);
-
-            Settings.ListenPort = endpoint.Port;
-            listener.ChangeEndpoint(endpoint);
+            if (Disposed)
+                throw new ObjectDisposedException (GetType ().Name);
         }
 
-        private void CheckDisposed()
+        public bool Contains (InfoHash infoHash)
         {
-            if (disposed)
-                throw new ObjectDisposedException(GetType().Name);
-        }
-
-        public bool Contains(InfoHash infoHash)
-        {
-            CheckDisposed();
+            CheckDisposed ();
             if (infoHash == null)
                 return false;
 
-            return torrents.Exists(delegate(TorrentManager m) { return m.InfoHash.Equals(infoHash); });
+            return publicTorrents.Exists (m => m.InfoHash.Equals (infoHash));
         }
 
-        public bool Contains(Torrent torrent)
+        public bool Contains (Torrent torrent)
         {
-            CheckDisposed();
+            CheckDisposed ();
             if (torrent == null)
                 return false;
 
             return Contains (torrent.InfoHash);
         }
 
-        public bool Contains(TorrentManager manager)
+        public bool Contains (TorrentManager manager)
         {
-            CheckDisposed();
+            CheckDisposed ();
             if (manager == null)
                 return false;
-            
-            return Contains(manager.Torrent);
+
+            return Contains (manager.Torrent);
         }
 
-        public void Dispose()
+        public void Dispose ()
         {
-            if (disposed)
+            if (Disposed)
                 return;
 
-            disposed = true;
-            MainLoop.QueueWait((MainLoopTask)delegate {
-                this.dhtEngine.Dispose();
-                this.diskManager.Dispose();
-                this.listenManager.Dispose();
-                this.localPeerListener.Stop();
-                this.localPeerManager.Dispose();
+            Disposed = true;
+            MainLoop.QueueWait (() => {
+                DhtEngine.Dispose ();
+                DiskManager.Dispose ();
+                listenManager.Dispose ();
+                LocalPeerDiscovery.Stop ();
             });
         }
 
-        private static string GeneratePeerId()
+        /// <summary>
+        /// Downloads the .torrent metadata for the provided MagnetLink.
+        /// </summary>
+        /// <param name="magnetLink">The MagnetLink to get the metadata for.</param>
+        /// <param name="token">The cancellation token used to to abort the download. This method will
+        /// only complete if the metadata successfully downloads, or the token is cancelled.</param>
+        /// <returns></returns>
+        public async Task<byte[]> DownloadMetadataAsync (MagnetLink magnetLink, CancellationToken token)
         {
-            StringBuilder sb = new StringBuilder(20);
+            var manager = new TorrentManager (magnetLink);
+            var metadataCompleted = new TaskCompletionSource<byte[]> ();
+            using var registration = token.Register (() => metadataCompleted.TrySetResult (null));
+            manager.MetadataReceived += (o, e) => metadataCompleted.TrySetResult (e.dict);
 
-            sb.Append(Common.VersionInfo.ClientVersion);
-            lock (random)
-                while (sb.Length < 20)
-                    sb.Append (random.Next (0, 9));
+            await Register (manager, isPublic: false);
+            await manager.StartAsync (metadataOnly: true);
+            var data = await metadataCompleted.Task;
+            await manager.StopAsync ();
+            await Unregister (manager);
 
-            return sb.ToString();
+            token.ThrowIfCancellationRequested ();
+            return data;
         }
 
-        public void PauseAll()
+        async void HandleLocalPeerFound (object sender, LocalPeerFoundEventArgs args)
         {
-            CheckDisposed();
-            MainLoop.QueueWait((MainLoopTask)delegate {
-                foreach (TorrentManager manager in torrents)
-                    manager.Pause();
-            });
-        }
+            try {
+                await MainLoop;
 
-        public void Register(TorrentManager manager)
-        {
-            CheckDisposed();
-            Check.Manager(manager);
+                TorrentManager manager = allTorrents.FirstOrDefault (t => t.InfoHash == args.InfoHash);
+                // There's no TorrentManager in the engine
+                if (manager == null)
+                    return;
 
-            MainLoop.QueueWait((MainLoopTask)delegate {
-                if (manager.Engine != null)
-                    throw new TorrentException("This manager has already been registered");
-
-                if (Contains(manager.Torrent))
-                    throw new TorrentException("A manager for this torrent has already been registered");
-                this.torrents.Add(manager);
-                manager.PieceHashed += PieceHashed;
-                manager.Engine = this;
-                manager.DownloadLimiter.Add(downloadLimiter);
-                manager.UploadLimiter.Add(uploadLimiter);
-                if (dhtEngine != null && manager.Torrent != null && manager.Torrent.Nodes != null && dhtEngine.State != DhtState.Ready)
-                {
-                    try
-                    {
-                        dhtEngine.Add(manager.Torrent.Nodes);
-                    }
-                    catch
-                    {
-                        // FIXME: Should log this somewhere, though it's not critical
-                    }
+                // The torrent is marked as private, so we can't add random people
+                if (manager.HasMetadata && manager.Torrent.IsPrivate) {
+                    manager.RaisePeersFound (new LocalPeersAdded (manager, 0, 0));
+                } else {
+                    // Add new peer to matched Torrent
+                    var peer = new Peer ("", args.Uri);
+                    int peersAdded = manager.AddPeer (peer, fromTrackers: false, prioritise: true) ? 1 : 0;
+                    manager.RaisePeersFound (new LocalPeersAdded (manager, peersAdded, 1));
                 }
-            });
-
-            if (TorrentRegistered != null)
-                TorrentRegistered(this, new TorrentEventArgs(manager));
-        }
-
-        public void RegisterDht(IDhtEngine engine)
-        {
-            MainLoop.QueueWait(delegate
-            {
-                if (dhtEngine != null)
-                {
-                    dhtEngine.StateChanged -= DhtEngineStateChanged;
-                    dhtEngine.Stop();
-                    dhtEngine.Dispose();
-                }
-                dhtEngine = engine ?? new NullDhtEngine ();
-            });
-
-            dhtEngine.StateChanged += DhtEngineStateChanged;
-        }
-
-        void DhtEngineStateChanged (object o, EventArgs e)
-        {
-            if (dhtEngine.State != DhtState.Ready)
-                return;
-
-            MainLoop.Queue (delegate {
-                foreach (TorrentManager manager in torrents) {
-                    if (!manager.CanUseDht)
-                        continue;
-
-                    dhtEngine.Announce (manager.InfoHash, Listener.Endpoint.Port);
-                    dhtEngine.GetPeers (manager.InfoHash);
-                }
-            });
-        }
-
-        public void StartAll()
-        {
-            CheckDisposed();
-            MainLoop.QueueWait((MainLoopTask)delegate {
-                for (int i = 0; i < torrents.Count; i++)
-                    torrents[i].Start();
-            });
-        }
-
-        public void StopAll()
-        {
-            CheckDisposed();
-
-            MainLoop.QueueWait((MainLoopTask)delegate {
-                for (int i = 0; i < torrents.Count; i++)
-                    torrents[i].Stop();
-            });
-        }
-
-        public int TotalDownloadSpeed
-        {
-            get
-            {
-                return (int)(long)Toolbox.Accumulate<TorrentManager>(torrents, delegate(TorrentManager m) { return m.Monitor.DownloadSpeed; });
+            } catch {
+                // We don't care if the peer couldn't be added (for whatever reason)
             }
         }
 
-        public int TotalUploadSpeed
+        public async Task PauseAll ()
         {
-            get
-            {
-                return (int)(long)Toolbox.Accumulate<TorrentManager>(torrents, delegate(TorrentManager m) { return m.Monitor.UploadSpeed; });
+            CheckDisposed ();
+            await MainLoop;
+
+            var tasks = new List<Task> ();
+            foreach (TorrentManager manager in publicTorrents)
+                tasks.Add (manager.PauseAsync ());
+            await Task.WhenAll (tasks);
+        }
+
+        public async Task Register (TorrentManager manager)
+            => await Register (manager, true);
+
+        async Task Register (TorrentManager manager, bool isPublic)
+        {
+            CheckDisposed ();
+            Check.Manager (manager);
+
+            await MainLoop;
+            if (manager.Engine != null)
+                throw new TorrentException ("This manager has already been registered");
+
+            if (Contains (manager.Torrent))
+                throw new TorrentException ("A manager for this torrent has already been registered");
+
+            allTorrents.Add (manager);
+            if (isPublic)
+                publicTorrents.Add (manager);
+            ConnectionManager.Add (manager);
+            listenManager.Add (manager.InfoHash);
+
+            manager.Engine = this;
+            manager.DownloadLimiters.Add (downloadLimiters);
+            manager.UploadLimiters.Add (uploadLimiters);
+            if (DhtEngine != null && manager.Torrent?.Nodes != null && DhtEngine.State != DhtState.Ready) {
+                try {
+                    DhtEngine.Add (manager.Torrent.Nodes);
+                } catch {
+                    // FIXME: Should log this somewhere, though it's not critical
+                }
             }
         }
 
-        public void Unregister(TorrentManager manager)
+        public async Task RegisterDhtAsync (IDhtEngine engine)
         {
-            CheckDisposed();
-            Check.Manager(manager);
+            await MainLoop;
 
-            MainLoop.QueueWait((MainLoopTask)delegate {
-                if (manager.Engine != this)
-                    throw new TorrentException("The manager has not been registered with this engine");
+            if (DhtEngine != null) {
+                DhtEngine.StateChanged -= DhtEngineStateChanged;
+                DhtEngine.PeersFound -= DhtEnginePeersFound;
+                await DhtEngine.StopAsync ();
+                DhtEngine.Dispose ();
+            }
+            DhtEngine = engine ?? new NullDhtEngine ();
 
-                if (manager.State != TorrentState.Stopped)
-                    throw new TorrentException("The manager must be stopped before it can be unregistered");
+            DhtEngine.StateChanged += DhtEngineStateChanged;
+            DhtEngine.PeersFound += DhtEnginePeersFound;
+        }
 
-                this.torrents.Remove(manager);
+        public async Task RegisterLocalPeerDiscoveryAsync (ILocalPeerDiscovery localPeerDiscovery)
+        {
+            await MainLoop;
+            RegisterLocalPeerDiscovery (localPeerDiscovery);
+        }
 
-                manager.PieceHashed -= PieceHashed;
-                manager.Engine = null;
-                manager.DownloadLimiter.Remove(downloadLimiter);
-                manager.UploadLimiter.Remove(uploadLimiter);
-            });
+        internal void RegisterLocalPeerDiscovery (ILocalPeerDiscovery localPeerDiscovery)
+        {
+            if (LocalPeerDiscovery != null) {
+                LocalPeerDiscovery.PeerFound -= HandleLocalPeerFound;
+                LocalPeerDiscovery.Stop ();
+            }
 
-            if (TorrentUnregistered != null)
-                TorrentUnregistered(this, new TorrentEventArgs(manager));
+            LocalPeerDiscovery = localPeerDiscovery ?? new NullLocalPeerDiscovery ();
+
+            if (LocalPeerDiscovery != null) {
+                LocalPeerDiscovery.PeerFound += HandleLocalPeerFound;
+                LocalPeerDiscovery.Start ();
+            }
+        }
+
+        async void DhtEnginePeersFound (object o, PeersFoundEventArgs e)
+        {
+            await MainLoop;
+
+            TorrentManager manager = allTorrents.FirstOrDefault (t => t.InfoHash == e.InfoHash);
+
+            if (manager == null)
+                return;
+
+            if (manager.CanUseDht) {
+                int successfullyAdded = await manager.AddPeersAsync (e.Peers);
+                manager.RaisePeersFound (new DhtPeersAdded (manager, successfullyAdded, e.Peers.Count));
+            } else {
+                // This is only used for unit testing to validate that even if the DHT engine
+                // finds peers for a private torrent, we will not add them to the manager.
+                manager.RaisePeersFound (new DhtPeersAdded (manager, 0, 0));
+            }
+        }
+
+        async void DhtEngineStateChanged (object o, EventArgs e)
+        {
+            if (DhtEngine.State != DhtState.Ready)
+                return;
+
+            await MainLoop;
+            foreach (TorrentManager manager in allTorrents) {
+                if (!manager.CanUseDht)
+                    continue;
+
+                if (Listener is ISocketListener listener)
+                    DhtEngine.Announce (manager.InfoHash, listener.EndPoint.Port);
+                else
+                    DhtEngine.Announce (manager.InfoHash, Settings.ListenPort);
+                DhtEngine.GetPeers (manager.InfoHash);
+            }
+        }
+
+        public async Task StartAllAsync ()
+        {
+            CheckDisposed ();
+
+            await MainLoop;
+
+            var tasks = new List<Task> ();
+            for (int i = 0; i < publicTorrents.Count; i++)
+                tasks.Add (publicTorrents[i].StartAsync ());
+            await Task.WhenAll (tasks);
+        }
+
+        /// <summary>
+        /// Stops all active <see cref="TorrentManager"/> instances.
+        /// </summary>
+        /// <returns></returns>
+        public Task StopAllAsync ()
+        {
+            return StopAllAsync (Timeout.InfiniteTimeSpan);
+        }
+
+        /// <summary>
+        /// Stops all active <see cref="TorrentManager"/> instances. The final announce for each <see cref="TorrentManager"/> will be limited
+        /// to the maximum of either 2 seconds or <paramref name="timeout"/> seconds.
+        /// </summary>
+        /// <param name="timeout">The timeout for the final tracker announce.</param>
+        /// <returns></returns>
+        public async Task StopAllAsync (TimeSpan timeout)
+        {
+            CheckDisposed ();
+
+            await MainLoop;
+            var tasks = new List<Task> ();
+            for (int i = 0; i < publicTorrents.Count; i++)
+                tasks.Add (publicTorrents[i].StopAsync (timeout));
+            await Task.WhenAll (tasks);
+        }
+
+        public async Task Unregister (TorrentManager manager)
+        {
+            CheckDisposed ();
+            Check.Manager (manager);
+
+            await MainLoop;
+            if (manager.Engine != this)
+                throw new TorrentException ("The manager has not been registered with this engine");
+
+            if (manager.State != TorrentState.Stopped)
+                throw new TorrentException ("The manager must be stopped before it can be unregistered");
+
+            allTorrents.Remove (manager);
+            publicTorrents.Remove (manager);
+            ConnectionManager.Remove (manager);
+            listenManager.Remove (manager.InfoHash);
+
+            manager.Engine = null;
+            manager.DownloadLimiters.Remove (downloadLimiters);
+            manager.UploadLimiters.Remove (uploadLimiters);
         }
 
         #endregion
@@ -453,62 +521,100 @@ namespace MonoTorrent.Client
 
         #region Private/Internal methods
 
-        internal void Broadcast(TorrentManager manager)
-        {
-            if (LocalPeerSearchEnabled)
-                localPeerManager.Broadcast(manager);
-        }
-
-        private void LogicTick()
+        void LogicTick ()
         {
             tickCount++;
 
-            if (tickCount % (1000 / TickLength) == 0)
-            {
-                diskManager.writeLimiter.UpdateChunks(settings.MaxWriteRate, diskManager.WriteRate);
-                diskManager.readLimiter.UpdateChunks(settings.MaxReadRate, diskManager.ReadRate);
+            if (tickCount % 2 == 0) {
+                downloadLimiter.UpdateChunks (Settings.MaximumDownloadSpeed, TotalDownloadSpeed);
+                uploadLimiter.UpdateChunks (Settings.MaximumUploadSpeed, TotalUploadSpeed);
             }
 
+            ConnectionManager.CancelPendingConnects ();
             ConnectionManager.TryConnect ();
-            for (int i = 0; i < this.torrents.Count; i++)
-                this.torrents[i].Mode.Tick(tickCount);
+            DiskManager.Tick ();
 
-            RaiseStatsUpdate(new StatsUpdateEventArgs());
+            for (int i = 0; i < allTorrents.Count; i++)
+                allTorrents[i].Mode.Tick (tickCount);
+
+            RaiseStatsUpdate (new StatsUpdateEventArgs ());
         }
 
-        internal void RaiseCriticalException(CriticalExceptionEventArgs e)
+        internal void RaiseCriticalException (CriticalExceptionEventArgs e)
         {
-            Toolbox.RaiseAsyncEvent<CriticalExceptionEventArgs>(CriticalException, this, e); 
-        }
-
-        private void PieceHashed(object sender, PieceHashedEventArgs e)
-        {
-            if (e.TorrentManager.State != TorrentState.Hashing)
-                diskManager.QueueFlush(e.TorrentManager, e.PieceIndex);
-        }
-
-        internal void RaiseStatsUpdate(StatsUpdateEventArgs args)
-        {
-            Toolbox.RaiseAsyncEvent<StatsUpdateEventArgs>(StatsUpdate, this, args);
+            CriticalException?.InvokeAsync (this, e);
         }
 
 
-        internal void Start()
+        internal void RaiseStatsUpdate (StatsUpdateEventArgs args)
         {
-            CheckDisposed();
-            isRunning = true;
-            if (listener.Status == ListenerStatus.NotListening)
-                listener.Start();
+            StatsUpdate?.InvokeAsync (this, args);
         }
 
-
-        internal void Stop()
+        internal async Task StartAsync ()
         {
-            CheckDisposed();
+            CheckDisposed ();
+            if (!IsRunning) {
+                IsRunning = true;
+                if (Listener.Status == ListenerStatus.NotListening)
+                    Listener.Start ();
+                await PortForwarder.RegisterMappingAsync (new Mapping (Protocol.Tcp, Settings.ListenPort));
+            }
+        }
+
+        /// <summary>
+        /// Sets <see cref="PortForwardingEnabled"/> to true and begins searching for uPnP or
+        /// NAT-PMP compatible devices. If any are discovered they will be used to forward the
+        /// ports used by the engine.
+        /// </summary>
+        /// <param name="token">If the token is cancelled and an <see cref="OperationCanceledException"/>
+        /// is thrown then the engine is guaranteed to not be searching for compatible devices.</param>
+        /// <returns></returns>
+        public async Task EnablePortForwardingAsync (CancellationToken token)
+        {
+            await PortForwarder.StartAsync (token);
+        }
+
+        /// <summary>
+        /// Sets <see cref="PortForwardingEnabled"/> to false and the engine will no longer
+        /// seach for uPnP or NAT-PMP compatible devices. Ports forwarding requests will
+        /// be deleted, where possible.
+        /// </summary>
+        /// <param name="token">If the token is cancelled the engine is guaranteed to no longer search
+        /// for compatible devices, but existing port forwarding requests may not be deleted.</param>
+        /// <returns></returns>
+        public async Task DisablePortForwardingAsync (CancellationToken token)
+        {
+            await PortForwarder.StopAsync (true, token);
+        }
+
+        internal async Task StopAsync ()
+        {
+            CheckDisposed ();
             // If all the torrents are stopped, stop ticking
-            isRunning = torrents.Exists(delegate(TorrentManager m) { return m.State != TorrentState.Stopped; });
-            if (!isRunning)
-                listener.Stop();
+            IsRunning = allTorrents.Exists (m => m.State != TorrentState.Stopped);
+            if (!IsRunning) {
+                Listener.Stop ();
+                await PortForwarder.UnregisterMappingAsync (new Mapping (Protocol.Tcp, Settings.ListenPort), CancellationToken.None);
+            }
+        }
+
+        static BEncodedString GeneratePeerId ()
+        {
+            var sb = new StringBuilder (20);
+            sb.Append ("-");
+            sb.Append (VersionInfo.ClientVersion);
+            sb.Append ("-");
+
+            // Create and use a single Random instance which *does not* use a seed so that
+            // the random sequence generated is definitely not the same between application
+            // restarts.
+            lock (PeerIdRandomGenerator) {
+                while (sb.Length < 20)
+                    sb.Append (PeerIdRandomGenerator.Next (0, 9));
+            }
+
+            return new BEncodedString (sb.ToString ());
         }
 
         #endregion

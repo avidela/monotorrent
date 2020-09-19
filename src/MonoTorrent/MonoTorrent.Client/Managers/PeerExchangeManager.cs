@@ -27,46 +27,45 @@
 //
 
 
-
 using System;
 using System.Collections.Generic;
 
 using MonoTorrent.Client.Messages.Libtorrent;
-using MonoTorrent.Common;
-using MonoTorrent.Client.Encryption;
 
 namespace MonoTorrent.Client
 {
     /// <summary>
     /// This class is used to send each minute a peer excahnge message to peer who have enable this protocol
     /// </summary>
-    public class PeerExchangeManager : IDisposable
+    class PeerExchangeManager : IDisposable
     {
         #region Member Variables
 
-        private PeerId id;
-        private List<Peer> addedPeers;
-        private List<Peer> droppedPeers;
-        private bool disposed = false;
-        private const int MAX_PEERS = 50;
+        readonly PeerId id;
+        readonly List<Peer> addedPeers;
+        readonly List<Peer> droppedPeers;
+        bool disposed;
+        const int MAX_PEERS = 50;
+
+        TorrentManager Manager { get; }
 
         #endregion Member Variables
 
         #region Constructors
 
-        internal PeerExchangeManager(PeerId id)
+        internal PeerExchangeManager (TorrentManager manager, PeerId id)
         {
+            Manager = manager;
             this.id = id;
 
-			this.addedPeers = new List<Peer>();
-			this.droppedPeers = new List<Peer>();
-            id.TorrentManager.OnPeerFound += new EventHandler<PeerAddedEventArgs>(OnAdd);
-            Start();
+            addedPeers = new List<Peer> ();
+            droppedPeers = new List<Peer> ();
+            manager.OnPeerFound += OnAdd;
         }
 
-        internal void OnAdd(object source, PeerAddedEventArgs e)
+        internal void OnAdd (object source, PeerAddedEventArgs e)
         {
-            addedPeers.Add(e.Peer);
+            addedPeers.Add (e.Peer);
         }
         // TODO onDropped!
         #endregion
@@ -74,56 +73,43 @@ namespace MonoTorrent.Client
 
         #region Methods
 
-        internal void Start()
+        internal void OnTick ()
         {
-            ClientEngine.MainLoop.QueueTimeout(TimeSpan.FromMinutes(1), delegate {
-                if (!disposed)
-                    OnTick();
-                return !disposed;
-            });
-        }
-
-        internal void OnTick()
-        {
-            if (!id.TorrentManager.Settings.EnablePeerExchange)
+            if (!Manager.Settings.AllowPeerExchange)
                 return;
 
             int len = (addedPeers.Count <= MAX_PEERS) ? addedPeers.Count : MAX_PEERS;
             byte[] added = new byte[len * 6];
             byte[] addedDotF = new byte[len];
-            for (int i = 0; i < len; i++)
-            {
-                addedPeers[i].CompactPeer(added, i * 6);
-                if ((addedPeers[i].Encryption & (EncryptionTypes.RC4Full | EncryptionTypes.RC4Header)) != EncryptionTypes.None)
-                {
+            for (int i = 0; i < len; i++) {
+                addedPeers[i].CompactPeer (added, i * 6);
+                if ((addedPeers[i].AllowedEncryption & (EncryptionTypes.RC4Full | EncryptionTypes.RC4Header)) != EncryptionTypes.None) {
                     addedDotF[i] = 0x01;
-                }
-                else
-                {
+                } else {
                     addedDotF[i] = 0x00;
                 }
 
-                addedDotF[i] |= (byte)(addedPeers[i].IsSeeder ? 0x02 : 0x00);
+                addedDotF[i] |= (byte) (addedPeers[i].IsSeeder ? 0x02 : 0x00);
             }
-            addedPeers.RemoveRange(0, len);
+            addedPeers.RemoveRange (0, len);
 
-            len = Math.Min(MAX_PEERS - len, droppedPeers.Count);
+            len = Math.Min (MAX_PEERS - len, droppedPeers.Count);
 
             byte[] dropped = new byte[len * 6];
             for (int i = 0; i < len; i++)
-                droppedPeers[i].CompactPeer(dropped, i * 6);
+                droppedPeers[i].CompactPeer (dropped, i * 6);
 
-            droppedPeers.RemoveRange(0, len);
-            id.Enqueue(new PeerExchangeMessage(id, added, addedDotF, dropped));
+            droppedPeers.RemoveRange (0, len);
+            id.MessageQueue.Enqueue (new PeerExchangeMessage (id, added, addedDotF, dropped));
         }
 
-        public void Dispose()
+        public void Dispose ()
         {
-            if(disposed)
+            if (disposed)
                 return;
 
             disposed = true;
-            id.TorrentManager.OnPeerFound -= new EventHandler<PeerAddedEventArgs>(OnAdd);
+            Manager.OnPeerFound -= OnAdd;
         }
 
         #endregion

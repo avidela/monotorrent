@@ -1,10 +1,10 @@
-//
+﻿//
 // DiskWriterTests.cs
 //
 // Authors:
 //   Alan McGovern alan.mcgovern@gmail.com
 //
-// Copyright (C) 2009 Alan McGovern
+// Copyright (C) 2020 Alan McGovern
 //
 // Permission is hereby granted, free of charge, to any person obtaining
 // a copy of this software and associated documentation files (the
@@ -27,158 +27,88 @@
 //
 
 
-
 using System;
 using System.Collections.Generic;
-using System.Text;
-using MonoTorrent.Client.PieceWriters;
-using MonoTorrent.Common;
-using NUnit.Framework;
 using System.IO;
-using System.Threading;
+using System.Linq;
+using System.Threading.Tasks;
+using NUnit.Framework;
+using ReusableTasks;
 
-namespace MonoTorrent.Client
+namespace MonoTorrent.Client.PieceWriters
 {
-    public class ExceptionWriter : PieceWriter
-    {
-        public bool exist, close, flush, move, read, write;
-
-        public override bool Exists(TorrentFile file)
-        {
-            if (exist)
-                throw new Exception("exists");
-            return true;
-        }
-
-        public override void Close(TorrentFile file)
-        {
-            if (close)
-                throw new Exception("close");
-        }
-
-        public override void Flush(TorrentFile file)
-        {
-            if (flush)
-                throw new Exception("flush");
-        }
-
-        public override void Move(string oldPath, string newPath, bool ignoreExisting)
-        {
-            if (move)
-                throw new Exception("move");
-        }
-
-        public override int Read(TorrentFile file, long offset, byte[] buffer, int bufferOffset, int count)
-        {
-            if (read)
-                throw new Exception("read");
-            return count;
-        }
-
-        public override void Write(TorrentFile file, long offset, byte[] buffer, int bufferOffset, int count)
-        {
-            if (write)
-                throw new Exception("write");
-        }
-    }
-
-    [TestFixture]
     public class DiskWriterTests
     {
-        byte [] data = new byte [Piece.BlockSize];
-        DiskManager diskManager;
-        ManualResetEvent handle;
-        TestRig rig;
-        ExceptionWriter writer;
-
-        [TestFixtureSetUp]
-        public void FixtureSetup()
-        {
-            rig = TestRig.CreateMultiFile();
-            diskManager = rig.Engine.DiskManager;
-        }
+        string Temp { get; set; }
+        ITorrentFileInfo[] Others { get; set; }
+        ITorrentFileInfo TorrentFile { get; set; }
 
         [SetUp]
-        public void Setup()
+        public void Setup ()
         {
-            writer = new ExceptionWriter();
-            diskManager.Writer = writer;
-            handle = new ManualResetEvent(false);
-            rig.Manager.Stop();
-        }
-
-        [TearDown]
-        public void Teardown()
-        {
-            handle.Close();
-        }
-
-        [TestFixtureTearDown]
-        public void FixtureTeardown()
-        {
-            rig.Dispose();
-        }
-
-        [Test]
-        public void CloseFail()
-        {
-            writer.close = true;
-            Hookup();
-            diskManager.CloseFileStreams(rig.Manager);
-            CheckFail();
-        }
-
-        [Test]
-        public void FlushFail()
-        {
-            writer.flush = true;
-            Hookup();
-            diskManager.QueueFlush(rig.Manager, 0);
-            CheckFail();
-        }
-
-        [Test]
-        public void MoveFail()
-        {
-            writer.move = true;
-            Hookup();
-            diskManager.MoveFiles(rig.Manager, "root", true);
-            CheckFail();
-        }
-
-        [Test]
-        public void ReadFail()
-        {
-            bool called = false;
-            writer.read = true;
-            Hookup();
-            diskManager.QueueRead(rig.Manager, 0, data, data.Length, delegate { called = true; });
-            CheckFail();
-            Assert.IsTrue (called, "#delegate called");
-        }
-
-        [Test]
-        public void WriteFail()
-        {
-            bool called = false;
-            writer.write = true;
-            Hookup();
-            diskManager.QueueWrite(rig.Manager, 0, data, data.Length, delegate { called = true; });
-            CheckFail();
-            Assert.IsTrue (called, "#delegate called");
-        }
-
-        void Hookup()
-        {
-            rig.Manager.TorrentStateChanged += delegate {
-                if (rig.Manager.State == TorrentState.Error)
-                    handle.Set();
+            Temp = Path.GetTempPath () + "monotorrent_tests";
+            TorrentFile = new TorrentFileInfo (new TorrentFile ("test.file", 12345), Path.Combine (Temp, "test.file"));
+            Others = new[] {
+                new TorrentFileInfo (new TorrentFile ("test2.file", 12345), Path.Combine (Temp, "test2.file")),
+                new TorrentFileInfo (new TorrentFile ("test3.file", 12345), Path.Combine (Temp, "test3.file")),
+                new TorrentFileInfo (new TorrentFile ("test4.file", 12345), Path.Combine (Temp, "test4.file")),
             };
         }
 
-        void CheckFail()
+        [TearDown]
+        public void Teardown ()
         {
-            Assert.IsTrue(handle.WaitOne(5000, true), "Failure was not handled");
+            if (Directory.Exists (Temp))
+                Directory.Delete (Temp, true);
+        }
+
+        [Test]
+        public async Task CloseFileAsync_Opened ()
+        {
+            using var writer = new DiskWriter ();
+            await writer.WriteAsync (TorrentFile, 0, new byte[10], 0, 10);
+            Assert.IsTrue (File.Exists (TorrentFile.FullPath));
+
+            Assert.DoesNotThrowAsync (async () => await writer.CloseAsync (TorrentFile));
+            File.Delete (TorrentFile.FullPath);
+        }
+
+        [Test]
+        public void CloseFileAsync_Unopened()
+        {
+            using var writer = new DiskWriter ();
+            Assert.DoesNotThrowAsync (async () => await writer.CloseAsync (TorrentFile));
+        }
+
+        [Test]
+        public async Task ExceedMaxOpenFiles ()
+        {
+            var streams = new List<ManualStream> ();
+            var streamCreated = new ReusableTaskCompletionSource<bool> ();
+            Func<ITorrentFileInfo, FileAccess, ITorrentFileStream> creator = (file, access) => {
+                var s = new ManualStream (file, access);
+                s.WriteTcs = new ReusableTaskCompletionSource<int> ();
+                streams.Add (s);
+                streamCreated.SetResult (true);
+                return s;
+            };
+            using var writer = new DiskWriter (creator, 1);
+
+            var writeTask = writer.WriteAsync (TorrentFile, 0, new byte[100], 0, 100);
+            await streamCreated.Task.WithTimeout ();
+
+            // There's a limit of 1 concurrent read/write.
+            var secondStreamWaiter = streamCreated.Task.AsTask ();
+            var secondStream = writer.WriteAsync (Others.First (), 0, new byte[100], 0, 100);
+            Assert.ThrowsAsync<TimeoutException> (() => secondStreamWaiter.WithTimeout (100));
+
+            streams[0].WriteTcs.SetResult (1);
+            await secondStreamWaiter.WithTimeout ();
+            streams[1].WriteTcs.SetResult (1);
+
+            await secondStream.WithTimeout ();
+            Assert.IsTrue (streams[0].Disposed);
+            Assert.IsFalse (streams[1].Disposed);
         }
     }
 }

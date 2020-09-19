@@ -27,385 +27,413 @@
 //
 
 
-
 using System;
 using System.Collections.Generic;
-using System.Text;
-using NUnit.Framework;
-using MonoTorrent.Client.Messages.UdpTracker;
-using MonoTorrent.Client.Tracker;
-using MonoTorrent.Common;
-using MonoTorrent.Client;
-using System.Threading;
+using System.Linq;
 using System.Net;
+using System.Net.Sockets;
+using System.Threading;
+using System.Threading.Tasks;
 
-namespace MonoTorrent.Client
+using MonoTorrent.BEncoding;
+using MonoTorrent.Client.Messages.UdpTracker;
+using MonoTorrent.Tracker.Listeners;
+
+using NUnit.Framework;
+
+namespace MonoTorrent.Client.Tracker
 {
     [TestFixture]
     public class UdpTrackerTests
     {
-        static void Main(string[] args)
+        static readonly BEncodedString PeerId = new BEncodedString (Enumerable.Repeat ((byte) 255, 20).ToArray ());
+        static readonly InfoHash InfoHash = new InfoHash (Enumerable.Repeat ((byte) 254, 20).ToArray ());
+
+        AnnounceParameters announceparams = new AnnounceParameters (100, 50, int.MaxValue,
+            TorrentEvent.Completed, InfoHash, false, PeerId, null, 1515, false);
+
+        readonly ScrapeParameters scrapeParams = new ScrapeParameters (new InfoHash (new byte[20]));
+        MonoTorrent.Tracker.TrackerServer server;
+        UdpTracker tracker;
+        IgnoringListener listener;
+        List<BEncodedString> keys;
+        List<IPEndPoint> peerEndpoints;
+
+        [OneTimeSetUp]
+        public void FixtureSetup ()
         {
-            UdpTrackerTests t = new UdpTrackerTests();
-            t.ConnectMessageTest();
-            t.ConnectResponseTest();
-            t.AnnounceMessageTest();
-            t.AnnounceResponseTest();
-            t.ScrapeMessageTest();
-            t.ScrapeResponseTest();
-            t.FixtureSetup();
-
-            t.AnnounceTest();
-            t.Setup();
-            t.ScrapeTest();
-
-            t.FixtureTeardown();
-        }
-
-        AnnounceParameters announceparams = new AnnounceParameters(100, 50, int.MaxValue,
-            MonoTorrent.Common.TorrentEvent.Completed,
-            new InfoHash (new byte[] { 1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2, 3, 4, 5 }),
-            false, new string('a', 20), null, 1515);
-        MonoTorrent.Tracker.Tracker server;
-        MonoTorrent.Tracker.Listeners.UdpListener listener;
-        List<string> keys;
-        string prefix = "udp://localhost:6767/announce/";
-
-        [TestFixtureSetUp]
-        public void FixtureSetup()
-        {
-            keys = new List<string>();
-            server = new MonoTorrent.Tracker.Tracker();
-            server.AllowUnregisteredTorrents = true;
-            listener = new MonoTorrent.Tracker.Listeners.UdpListener(6767);
-            listener.AnnounceReceived += delegate(object o, MonoTorrent.Tracker.AnnounceParameters e)
-            {
-                keys.Add(e.Key);
+            listener = new IgnoringListener (0);
+            listener.AnnounceReceived += delegate (object o, MonoTorrent.Tracker.AnnounceRequest e) {
+                keys.Add (e.Key);
             };
-            server.RegisterListener(listener);
-
-            listener.Start();
+            listener.Start ();
         }
 
         [SetUp]
-        public void Setup()
+        public void Setup ()
         {
-            keys.Clear();
+            keys = new List<BEncodedString> ();
+            server = new MonoTorrent.Tracker.TrackerServer ();
+            server.AllowUnregisteredTorrents = true;
+            server.RegisterListener (listener);
+
+            peerEndpoints = new List<IPEndPoint> {
+                new IPEndPoint (IPAddress.Parse ("123.123.123.123"), 12312),
+                new IPEndPoint (IPAddress.Parse ("254.254.254.254"), 3522),
+                new IPEndPoint (IPAddress.Parse ("1.1.1.1"), 123),
+                new IPEndPoint (IPAddress.Parse ("1.2.3.4"), 65000),
+            };
+
+            tracker = (UdpTracker) TrackerFactory.Create (new Uri ($"udp://127.0.0.1:{listener.EndPoint.Port}/announce/"));
+            announceparams = announceparams.WithPort (listener.EndPoint.Port);
+
+            listener.IgnoreAnnounces = false;
+            listener.IgnoreConnects = false;
+            listener.IgnoreErrors = false;
+            listener.IgnoreScrapes = false;
+            listener.IncompleteAnnounce = listener.IncompleteConnect = listener.IncompleteScrape = false;
         }
 
-        [TestFixtureTearDown]
-        public void FixtureTeardown()
+        [TearDown]
+        public void Teardown ()
         {
-            listener.Stop();
-            server.Dispose();
+            server.UnregisterListener (listener);
         }
 
-        [Test]
-        public void AnnounceMessageTest()
+        [OneTimeTearDown]
+        public void FixtureTeardown ()
         {
-            AnnounceMessage m = new AnnounceMessage(0, 12345, announceparams);
-            AnnounceMessage d = (AnnounceMessage)UdpTrackerMessage.DecodeMessage(m.Encode(), 0, m.ByteLength, MessageType.Request);
-            Check(m, MessageType.Request);
-
-            Assert.AreEqual(1, m.Action);
-            Assert.AreEqual(m.Action, d.Action);
-            Assert.IsTrue(Toolbox.ByteMatch(m.Encode(), d.Encode()));
-            Assert.AreEqual(12345, d.ConnectionId);
-        }
-
-        [Test]
-        public void AnnounceResponseTest()
-        {
-            List<Peer> peers = new List<Peer>();
-            peers.Add(new Peer(new string('1', 20), new Uri("tcp://127.0.0.1:1")));
-            peers.Add(new Peer(new string('2', 20), new Uri("tcp://127.0.0.1:2")));
-            peers.Add(new Peer(new string('3', 20), new Uri("tcp://127.0.0.1:3")));
-
-            AnnounceResponseMessage m = new AnnounceResponseMessage(12345, TimeSpan.FromSeconds(10), 43, 65, peers);
-            AnnounceResponseMessage d = (AnnounceResponseMessage)UdpTrackerMessage.DecodeMessage(m.Encode(), 0, m.ByteLength, MessageType.Response);
-            Check(m, MessageType.Response);
-
-            Assert.AreEqual(1, m.Action);
-            Assert.AreEqual(m.Action, d.Action);
-            Assert.IsTrue(Toolbox.ByteMatch(m.Encode(), d.Encode()));
-            Assert.AreEqual(12345, d.TransactionId);
+            listener.Stop ();
+            server.Dispose ();
         }
 
         [Test]
-        public void ConnectMessageTest()
+        public void AnnounceMessageTest ()
         {
-            ConnectMessage m = new ConnectMessage();
-            ConnectMessage d = (ConnectMessage)UdpTrackerMessage.DecodeMessage(m.Encode(), 0, m.ByteLength, MessageType.Request);
-            Check(m, MessageType.Request);
-            
-            Assert.AreEqual(0, m.Action, "#0");
-            Assert.AreEqual(m.Action, d.Action, "#1");
-            Assert.AreEqual(m.ConnectionId, d.ConnectionId, "#2");
-            Assert.AreEqual(m.TransactionId, d.TransactionId, "#3");
-            Assert.IsTrue(Toolbox.ByteMatch(m.Encode(), d.Encode()), "#4");
+            AnnounceMessage m = new AnnounceMessage (0, 12345, announceparams);
+            AnnounceMessage d = (AnnounceMessage) UdpTrackerMessage.DecodeMessage (m.Encode (), 0, m.ByteLength, MessageType.Request);
+            Check (m, MessageType.Request);
+
+            Assert.AreEqual (1, m.Action);
+            Assert.AreEqual (m.Action, d.Action);
+            Assert.IsTrue (Toolbox.ByteMatch (m.Encode (), d.Encode ()));
+            Assert.AreEqual (12345, d.ConnectionId);
         }
 
         [Test]
-        public void ConnectResponseTest()
+        public void AnnounceResponseTest ()
         {
-            ConnectResponseMessage m = new ConnectResponseMessage(5371, 12345);
-            ConnectResponseMessage d = (ConnectResponseMessage)UdpTrackerMessage.DecodeMessage(m.Encode(), 0, m.ByteLength, MessageType.Response);
-            Check(m, MessageType.Response);
-            
-            Assert.AreEqual(0, m.Action, "#0"); 
-            Assert.AreEqual(m.Action, d.Action, "#1");
-            Assert.AreEqual(m.ConnectionId, d.ConnectionId, "#2");
-            Assert.AreEqual(m.TransactionId, d.TransactionId, "#3");
-            Assert.IsTrue(Toolbox.ByteMatch(m.Encode(), d.Encode()), "#4");
-            Assert.AreEqual(12345, d.ConnectionId);
-            Assert.AreEqual(5371, d.TransactionId);
+            var peers = peerEndpoints.Select (t => new Peer ("", new Uri ($"ipv4://{t.Address}:{t.Port}"))).ToList ();
+            AnnounceResponseMessage m = new AnnounceResponseMessage (12345, TimeSpan.FromSeconds (10), 43, 65, peers);
+            AnnounceResponseMessage d = (AnnounceResponseMessage) UdpTrackerMessage.DecodeMessage (m.Encode (), 0, m.ByteLength, MessageType.Response);
+            Check (m, MessageType.Response);
+
+            Assert.AreEqual (1, m.Action);
+            Assert.AreEqual (m.Action, d.Action);
+            Assert.IsTrue (Toolbox.ByteMatch (m.Encode (), d.Encode ()));
+            Assert.AreEqual (12345, d.TransactionId);
+        }
+
+        [Test]
+        public void ConnectMessageTest ()
+        {
+            ConnectMessage m = new ConnectMessage ();
+            ConnectMessage d = (ConnectMessage) UdpTrackerMessage.DecodeMessage (m.Encode (), 0, m.ByteLength, MessageType.Request);
+            Check (m, MessageType.Request);
+
+            Assert.AreEqual (0, m.Action, "#0");
+            Assert.AreEqual (m.Action, d.Action, "#1");
+            Assert.AreEqual (m.ConnectionId, d.ConnectionId, "#2");
+            Assert.AreEqual (m.TransactionId, d.TransactionId, "#3");
+            Assert.IsTrue (Toolbox.ByteMatch (m.Encode (), d.Encode ()), "#4");
+        }
+
+        [Test]
+        public void ConnectResponseTest ()
+        {
+            ConnectResponseMessage m = new ConnectResponseMessage (5371, 12345);
+            ConnectResponseMessage d = (ConnectResponseMessage) UdpTrackerMessage.DecodeMessage (m.Encode (), 0, m.ByteLength, MessageType.Response);
+            Check (m, MessageType.Response);
+
+            Assert.AreEqual (0, m.Action, "#0");
+            Assert.AreEqual (m.Action, d.Action, "#1");
+            Assert.AreEqual (m.ConnectionId, d.ConnectionId, "#2");
+            Assert.AreEqual (m.TransactionId, d.TransactionId, "#3");
+            Assert.IsTrue (Toolbox.ByteMatch (m.Encode (), d.Encode ()), "#4");
+            Assert.AreEqual (12345, d.ConnectionId);
+            Assert.AreEqual (5371, d.TransactionId);
 
         }
 
         [Test]
-        public void ScrapeMessageTest()
+        public void ScrapeMessageTest ()
         {
-            List<byte[]> hashes = new List<byte[]>();
-            Random r = new Random();
+            List<byte[]> hashes = new List<byte[]> ();
+            Random r = new Random ();
             byte[] hash1 = new byte[20];
             byte[] hash2 = new byte[20];
             byte[] hash3 = new byte[20];
-            r.NextBytes(hash1);
-            r.NextBytes(hash2);
-            r.NextBytes(hash3);
-            hashes.Add(hash1);
-            hashes.Add(hash2);
-            hashes.Add(hash3);
+            r.NextBytes (hash1);
+            r.NextBytes (hash2);
+            r.NextBytes (hash3);
+            hashes.Add (hash1);
+            hashes.Add (hash2);
+            hashes.Add (hash3);
 
-            ScrapeMessage m = new ScrapeMessage(12345, 123, hashes);
-            ScrapeMessage d = (ScrapeMessage)UdpTrackerMessage.DecodeMessage(m.Encode(), 0, m.ByteLength, MessageType.Request);
-            Check(m, MessageType.Request);
-            
-            Assert.AreEqual(2, m.Action);
-            Assert.AreEqual(m.Action, d.Action);
-            Assert.IsTrue(Toolbox.ByteMatch(m.Encode(), d.Encode()));
+            ScrapeMessage m = new ScrapeMessage (12345, 123, hashes);
+            ScrapeMessage d = (ScrapeMessage) UdpTrackerMessage.DecodeMessage (m.Encode (), 0, m.ByteLength, MessageType.Request);
+            Check (m, MessageType.Request);
+
+            Assert.AreEqual (2, m.Action);
+            Assert.AreEqual (m.Action, d.Action);
+            Assert.IsTrue (Toolbox.ByteMatch (m.Encode (), d.Encode ()));
         }
 
         [Test]
-        public void ScrapeResponseTest()
+        public void ScrapeResponseTest ()
         {
-            List<ScrapeDetails> details = new List<ScrapeDetails>();
-            details.Add(new ScrapeDetails(1, 2, 3));
-            details.Add(new ScrapeDetails(4, 5, 6));
-            details.Add(new ScrapeDetails(7, 8, 9));
-            
-            ScrapeResponseMessage m = new ScrapeResponseMessage(12345, details);
-            ScrapeResponseMessage d = (ScrapeResponseMessage)UdpTrackerMessage.DecodeMessage(m.Encode(), 0, m.ByteLength, MessageType.Response);
-            Check(m, MessageType.Response);
-            
-            Assert.AreEqual(2, m.Action);
-            Assert.AreEqual(m.Action, d.Action);
-            Assert.IsTrue(Toolbox.ByteMatch(m.Encode(), d.Encode()));
-            Assert.AreEqual(12345, d.TransactionId);
-        }
-
-        void Check(UdpTrackerMessage message, MessageType type)
-        {
-            byte[] e = message.Encode();
-            Assert.AreEqual(e.Length, message.ByteLength, "#1");
-            Assert.IsTrue(Toolbox.ByteMatch(e, UdpTrackerMessage.DecodeMessage(e, 0, e.Length, type).Encode()), "#2");
-        }
-
-        [Test]
-        public void AnnounceTest()
-        {
-            UdpTracker t = (UdpTracker)TrackerFactory.Create(new Uri(prefix));
-            TrackerConnectionID id = new TrackerConnectionID(t, false, TorrentEvent.Started, new ManualResetEvent(false));
-
-            AnnounceResponseEventArgs p = null;
-            t.AnnounceComplete += delegate(object o, AnnounceResponseEventArgs e)
-            {
-                p = e;
-                id.WaitHandle.Set();
+            List<ScrapeDetails> details = new List<ScrapeDetails> {
+                new ScrapeDetails (1, 2, 3),
+                new ScrapeDetails (4, 5, 6),
+                new ScrapeDetails (7, 8, 9)
             };
-            MonoTorrent.Client.Tracker.AnnounceParameters pars = new AnnounceParameters();
-            pars.InfoHash = new InfoHash(new byte[20]);
-            pars.PeerId = "";
 
-            t.Announce(pars, id);
-            Wait(id.WaitHandle);
-            Assert.IsNotNull(p, "#1");
-            Assert.IsTrue(p.Successful);
-            //Assert.AreEqual(keys[0], t.Key, "#2");
+            ScrapeResponseMessage m = new ScrapeResponseMessage (12345, details);
+            ScrapeResponseMessage d = (ScrapeResponseMessage) UdpTrackerMessage.DecodeMessage (m.Encode (), 0, m.ByteLength, MessageType.Response);
+            Check (m, MessageType.Response);
+
+            Assert.AreEqual (2, m.Action);
+            Assert.AreEqual (m.Action, d.Action);
+            Assert.IsTrue (Toolbox.ByteMatch (m.Encode (), d.Encode ()));
+            Assert.AreEqual (12345, d.TransactionId);
+        }
+
+        void Check (UdpTrackerMessage message, MessageType type)
+        {
+            byte[] e = message.Encode ();
+            Assert.AreEqual (e.Length, message.ByteLength, "#1");
+            Assert.IsTrue (Toolbox.ByteMatch (e, UdpTrackerMessage.DecodeMessage (e, 0, e.Length, type).Encode ()), "#2");
         }
 
         [Test]
-        public void AnnounceTest_NoConnect()
+        public async Task AnnounceTest ()
         {
-            IgnoringListener listener = new IgnoringListener(57532);
-            try
-            {
-                listener.IgnoreConnects = true;
-                listener.Start();
-                OfflineAnnounceTest();
-            }
-            finally
-            {
-                listener.Stop();
-            }
+            announceparams = announceparams
+                .WithBytesDownloaded (123)
+                .WithBytesLeft (456)
+                .WithBytesUploaded (789);
+
+            var announceArgsTask = new TaskCompletionSource<MonoTorrent.Tracker.AnnounceEventArgs> ();
+            server.PeerAnnounced += (o, e) => announceArgsTask.TrySetResult (e);
+            await tracker.AnnounceAsync (announceparams, CancellationToken.None);
+
+            await announceArgsTask.Task;
+
+            var args = announceArgsTask.Task.Result;
+            Assert.AreEqual (PeerId, args.Peer.PeerId, "#1");
+            Assert.AreEqual (123, args.Peer.Downloaded);
+            Assert.AreEqual (456, args.Peer.Remaining);
+            Assert.AreEqual (789, args.Peer.Uploaded);
         }
 
         [Test]
-        public void AnnounceTest_NoAnnounce()
+        public async Task AnnounceTest_GetPeers ()
         {
-            IgnoringListener listener = new IgnoringListener(57532);
-            try
-            {
-                listener.IgnoreAnnounces = true;
-                listener.Start();
-                OfflineAnnounceTest();
-            }
-            finally
-            {
-                listener.Stop();
-            }
-        }
+            var trackable = new MonoTorrent.Tracker.InfoHashTrackable ("Test", InfoHash);
+            server.Add (trackable);
+            var manager = (MonoTorrent.Tracker.SimpleTorrentManager) server.GetTrackerItem (trackable);
+            foreach (var p in peerEndpoints)
+                manager.Add (new MonoTorrent.Tracker.Peer (p, p));
 
-        [Test]
-        public void ScrapeTest_NoConnect()
-        {
-            IgnoringListener listener = new IgnoringListener(57532);
-            try
-            {
-                listener.IgnoreConnects = true;
-                listener.Start();
-                OfflineScrapeTest();
-            }
-            finally
-            {
-                listener.Stop();
+            var response = await tracker.AnnounceAsync (announceparams, CancellationToken.None);
+            var endpoints = response.Peers.Select (t => new IPEndPoint (IPAddress.Parse (t.ConnectionUri.Host), t.ConnectionUri.Port)).ToArray ();
+            foreach (var p in peerEndpoints) {
+                Assert.IsTrue (endpoints.Contains (p), "#1." + p);
             }
         }
 
         [Test]
-        public void ScrapeTest_NoScrapes()
+        public async Task AnnounceTest_IncompleteAnnounce ()
         {
-            IgnoringListener listener = new IgnoringListener(57532);
-            try
-            {
-                listener.IgnoreScrapes = true;
-                listener.Start();
-                OfflineScrapeTest();
-            }
-            finally
-            {
-                listener.Stop();
-            }
-        }
+            listener.IncompleteAnnounce = true;
+            Assert.ThrowsAsync<TrackerException> (() => tracker.AnnounceAsync (announceparams, CancellationToken.None).WithTimeout ());
+            Assert.AreEqual (TrackerState.InvalidResponse, tracker.Status);
 
-        void OfflineAnnounceTest()
-        {
-            UdpTracker t = (UdpTracker)TrackerFactory.Create(new Uri("udp://127.0.0.1:57532/announce"));
-            t.RetryDelay = TimeSpan.FromMilliseconds(500);
-            TrackerConnectionID id = new TrackerConnectionID(t, false, TorrentEvent.Started, new ManualResetEvent(false));
-
-            AnnounceResponseEventArgs p = null;
-            t.AnnounceComplete += delegate(object o, AnnounceResponseEventArgs e) {
-                p = e;
-                id.WaitHandle.Set();
-            };
-            MonoTorrent.Client.Tracker.AnnounceParameters pars = new AnnounceParameters();
-            pars.InfoHash = new InfoHash(new byte[20]);
-            pars.PeerId = "";
-
-            t.Announce(pars, id);
-            Wait(id.WaitHandle);
-            Assert.IsNotNull(p, "#1");
-            Assert.IsFalse(p.Successful);
-        }
-
-        void OfflineScrapeTest()
-        {
-            UdpTracker t = (UdpTracker)TrackerFactory.Create(new Uri("udp://127.0.0.1:57532/announce"));
-            t.RetryDelay = TimeSpan.FromMilliseconds(500);
-            TrackerConnectionID id = new TrackerConnectionID(t, false, TorrentEvent.Started, new ManualResetEvent(false));
-
-            ScrapeResponseEventArgs p = null;
-            t.ScrapeComplete += delegate(object o, ScrapeResponseEventArgs e)
-            {
-                if (e.Successful)
-                    Console.ReadLine();
-                p = e;
-                id.WaitHandle.Set();
-            };
-            MonoTorrent.Client.Tracker.ScrapeParameters pars = new ScrapeParameters(new InfoHash(new byte[20]));
-
-            t.Scrape(pars, id);
-            Wait(id.WaitHandle);
-            Assert.IsNotNull(p, "#1");
-            Assert.IsFalse(p.Successful);
+            listener.IncompleteAnnounce = false;
+            await tracker.AnnounceAsync (announceparams, CancellationToken.None);
+            Assert.AreEqual (TrackerState.Ok, tracker.Status);
         }
 
         [Test]
-        public void ScrapeTest()
+        public async Task AnnounceTest_IncompleteConnect ()
         {
-            UdpTracker t = (UdpTracker)TrackerFactory.Create(new Uri(prefix));
-            Assert.IsTrue(t.CanScrape, "#1");
-            TrackerConnectionID id = new TrackerConnectionID(t, false, TorrentEvent.Started, new ManualResetEvent(false));
+            listener.IncompleteConnect = true;
+            Assert.ThrowsAsync<TrackerException> (() => tracker.AnnounceAsync (announceparams, CancellationToken.None).AsTask ());
+            Assert.AreEqual (TrackerState.InvalidResponse, tracker.Status);
 
-            ScrapeResponseEventArgs p = null;
-            t.ScrapeComplete += delegate(object o, ScrapeResponseEventArgs e)
-            {
-                p = e;
-                id.WaitHandle.Set();
-            };
-            MonoTorrent.Client.Tracker.ScrapeParameters pars = new ScrapeParameters(new InfoHash(new byte[20]));
+            listener.IncompleteConnect = false;
+            await tracker.AnnounceAsync (announceparams, CancellationToken.None);
+            Assert.AreEqual (TrackerState.Ok, tracker.Status);
 
-            t.Scrape(pars, id);
-            Wait(id.WaitHandle);
-            Assert.IsNotNull(p, "#2");
-            Assert.IsTrue(p.Successful, "#3");
-            Assert.AreEqual(0, t.Complete, "#1");
-            Assert.AreEqual(0, t.Incomplete, "#2");
-            Assert.AreEqual(0, t.Downloaded, "#3");
         }
 
-        void Wait(WaitHandle handle)
+        [Test]
+        public void AnnounceTest_NoConnect ()
         {
-            Assert.IsTrue(handle.WaitOne(1000000, true), "Wait handle failed to trigger");
+            tracker.RetryDelay = TimeSpan.Zero;
+            listener.IgnoreConnects = true;
+            Assert.ThrowsAsync<TrackerException> (() => tracker.AnnounceAsync (announceparams, CancellationToken.None).AsTask ());
+            Assert.AreEqual (TrackerState.Offline, tracker.Status);
+        }
+
+        [Test]
+        public async Task AnnounceTest_NoConnect_ThenConnect ()
+        {
+            tracker.RetryDelay = TimeSpan.Zero;
+            listener.IgnoreConnects = true;
+            Assert.ThrowsAsync<TrackerException> (() => tracker.AnnounceAsync (announceparams, CancellationToken.None).AsTask ());
+
+            tracker.RetryDelay = TimeSpan.FromSeconds (5);
+            listener.IgnoreConnects = false;
+            await tracker.AnnounceAsync (announceparams, CancellationToken.None);
+        }
+
+        [Test]
+        public void AnnounceTest_NoAnnounce ()
+        {
+            tracker.RetryDelay = TimeSpan.Zero;
+            listener.IgnoreAnnounces = true;
+            Assert.ThrowsAsync<TrackerException> (() => tracker.AnnounceAsync (announceparams, CancellationToken.None).AsTask ());
+            Assert.AreEqual (TrackerState.Offline, tracker.Status);
+        }
+
+        [Test]
+        public async Task AnnounceTest_NoAnnounce_ThenAnnounce ()
+        {
+            tracker.RetryDelay = TimeSpan.Zero;
+            listener.IgnoreAnnounces = true;
+            Assert.ThrowsAsync<TrackerException> (() => tracker.AnnounceAsync (announceparams, CancellationToken.None).AsTask ());
+
+            tracker.RetryDelay = TimeSpan.FromSeconds (5);
+            listener.IgnoreAnnounces = false;
+            await tracker.AnnounceAsync (announceparams, CancellationToken.None);
+        }
+
+        [Test]
+        public async Task ScrapeTest ()
+        {
+            await tracker.ScrapeAsync (scrapeParams, CancellationToken.None);
+            Assert.AreEqual (0, tracker.Complete, "#1");
+            Assert.AreEqual (0, tracker.Incomplete, "#2");
+            Assert.AreEqual (0, tracker.Downloaded, "#3");
+        }
+
+        [Test]
+        public void ScrapeTest_NoConnect ()
+        {
+            tracker.RetryDelay = TimeSpan.Zero;
+            listener.IgnoreConnects = true;
+            Assert.ThrowsAsync<TrackerException> (() => tracker.ScrapeAsync (scrapeParams, CancellationToken.None).AsTask ());
+        }
+
+        [Test]
+        public async Task ScrapeTest_NoConnect_ThenConnect ()
+        {
+            tracker.RetryDelay = TimeSpan.Zero;
+            listener.IgnoreConnects = true;
+            Assert.ThrowsAsync<TrackerException> (() => tracker.ScrapeAsync (scrapeParams, CancellationToken.None).AsTask ());
+
+            tracker.RetryDelay = TimeSpan.FromSeconds (5);
+            listener.IgnoreConnects = false;
+            await tracker.ScrapeAsync (scrapeParams, CancellationToken.None);
+        }
+
+        [Test]
+        public async Task ScrapeTest_Incomplete ()
+        {
+            listener.IncompleteScrape = true;
+            Assert.ThrowsAsync<TrackerException> (() => tracker.ScrapeAsync (scrapeParams, CancellationToken.None).AsTask ());
+            Assert.AreEqual (TrackerState.InvalidResponse, tracker.Status);
+
+            listener.IncompleteScrape = false;
+            await tracker.ScrapeAsync (scrapeParams, CancellationToken.None);
+            Assert.AreEqual (TrackerState.Ok, tracker.Status);
+        }
+
+        [Test]
+        public void ScrapeTest_NoScrapes ()
+        {
+            tracker.RetryDelay = TimeSpan.Zero;
+            listener.IgnoreScrapes = true;
+            Assert.ThrowsAsync<TrackerException> (() => tracker.ScrapeAsync (scrapeParams, CancellationToken.None).AsTask ());
+            Assert.AreEqual (TrackerState.Offline, tracker.Status);
+        }
+
+        [Test]
+        public async Task ScrapeTest_NoScrapes_ThenScrape ()
+        {
+            tracker.RetryDelay = TimeSpan.Zero;
+            listener.IgnoreScrapes = true;
+            Assert.ThrowsAsync<TrackerException> (() => tracker.ScrapeAsync (scrapeParams, CancellationToken.None).AsTask ());
+
+            tracker.RetryDelay = TimeSpan.FromSeconds (5);
+            listener.IgnoreScrapes = false;
+            await tracker.ScrapeAsync (scrapeParams, CancellationToken.None);
         }
     }
 
-    class IgnoringListener : MonoTorrent.Tracker.Listeners.UdpListener
+    class IgnoringListener : UdpTrackerListener
     {
         public bool IgnoreConnects;
         public bool IgnoreAnnounces;
         public bool IgnoreErrors;
         public bool IgnoreScrapes;
 
-        public IgnoringListener(int port)
-            : base(port)
+        public bool IncompleteAnnounce { get; set; }
+        public bool IncompleteConnect { get; set; }
+        public bool IncompleteScrape { get; set; }
+
+        public IgnoringListener (int port)
+            : base (port)
         {
 
         }
 
-        protected override void ReceiveConnect(ConnectMessage connectMessage)
+        protected override async Task ReceiveConnect (UdpClient client, ConnectMessage connectMessage, IPEndPoint remotePeer)
         {
+            if (IncompleteConnect) {
+                await client.SendAsync (Enumerable.Repeat ((byte) 200, 50).ToArray (), 50, remotePeer);
+                return;
+            }
             if (!IgnoreConnects)
-                base.ReceiveConnect(connectMessage);
+                await base.ReceiveConnect (client, connectMessage, remotePeer);
         }
 
-        protected override void ReceiveAnnounce(AnnounceMessage announceMessage)
+        protected override async Task ReceiveAnnounce (UdpClient client, AnnounceMessage announceMessage, IPEndPoint remotePeer)
         {
+            if (IncompleteAnnounce) {
+                await client.SendAsync (Enumerable.Repeat ((byte) 200, 50).ToArray (), 50, remotePeer);
+                return;
+            }
+
             if (!IgnoreAnnounces)
-                base.ReceiveAnnounce(announceMessage);
+                await base.ReceiveAnnounce (client, announceMessage, remotePeer);
         }
 
-        protected override void ReceiveError(ErrorMessage errorMessage)
+        protected override async Task ReceiveError (UdpClient client, ErrorMessage errorMessage, IPEndPoint remotePeer)
         {
             if (!IgnoreErrors)
-                base.ReceiveError(errorMessage);
+                await base.ReceiveError (client, errorMessage, remotePeer);
         }
 
-        protected override void ReceiveScrape(ScrapeMessage scrapeMessage)
+        protected override async Task ReceiveScrape (UdpClient client, ScrapeMessage scrapeMessage, IPEndPoint remotePeer)
         {
+            if (IncompleteScrape) {
+                await client.SendAsync (Enumerable.Repeat ((byte) 200, 50).ToArray (), 50, remotePeer);
+                return;
+            }
             if (!IgnoreScrapes)
-                base.ReceiveScrape(scrapeMessage);
+                await base.ReceiveScrape (client, scrapeMessage, remotePeer);
         }
     }
 }

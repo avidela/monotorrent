@@ -27,53 +27,44 @@
 //
 
 
+using ReusableTasks;
 
-using System;
-using System.Collections.Generic;
-using System.Text;
-using MonoTorrent.Client.PieceWriters;
-using MonoTorrent.Common;
-
-namespace MonoTorrent.Client
+namespace MonoTorrent.Client.PieceWriters
 {
-    public class NullWriter : PieceWriter
+    public class NullWriter : IPieceWriter
     {
-        public NullWriter()
+        public ReusableTask CloseAsync (ITorrentFileInfo file)
         {
-
-        }
-        public override int Read(TorrentFile file, long offset, byte[] buffer, int bufferOffset, int count)
-        {
-            return 0;
+            return ReusableTask.CompletedTask;
         }
 
-        public override void Write(TorrentFile file, long offset, byte[] buffer, int bufferOffset, int count)
+        public void Dispose ()
         {
-
         }
 
-        public override void Close(TorrentFile file)
+        public ReusableTask<bool> ExistsAsync (ITorrentFileInfo file)
         {
-
+            return ReusableTask.FromResult (false);
         }
 
-        public override void Flush(TorrentFile file)
+        public ReusableTask FlushAsync (ITorrentFileInfo file)
         {
-
-        }
-        public override void Dispose()
-        {
-
+            return ReusableTask.CompletedTask;
         }
 
-        public override bool Exists(TorrentFile file)
+        public ReusableTask MoveAsync (ITorrentFileInfo file, string fullPath, bool overwrite)
         {
-            return false;
+            return ReusableTask.CompletedTask;
         }
 
-        public override void Move(string oldPath, string newPath, bool ignoreExisting)
+        public ReusableTask<int> ReadAsync (ITorrentFileInfo file, long offset, byte[] buffer, int bufferOffset, int count)
         {
+            return ReusableTask.FromResult (0);
+        }
 
+        public ReusableTask WriteAsync (ITorrentFileInfo file, long offset, byte[] buffer, int bufferOffset, int count)
+        {
+            return ReusableTask.CompletedTask;
         }
     }
 }

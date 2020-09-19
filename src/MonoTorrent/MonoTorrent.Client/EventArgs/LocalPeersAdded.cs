@@ -26,16 +26,16 @@
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 //
 
-using System;
-using System.Collections.Generic;
-using System.Text;
 
 namespace MonoTorrent.Client
 {
-    public class LocalPeersAdded : PeersAddedEventArgs
+    /// <summary>
+    /// Indicates peers were received from Local Peer Discovery
+    /// </summary>
+    public sealed class LocalPeersAdded : PeersAddedEventArgs
     {
-        public LocalPeersAdded(TorrentManager manager, int peersAdded, int total)
-            : base(manager, peersAdded, total)
+        public LocalPeersAdded (TorrentManager manager, int peersAdded, int total)
+            : base (manager, peersAdded, total)
         {
 
         }

@@ -29,243 +29,185 @@
 
 using System;
 using System.Collections.Generic;
-using System.Text;
+using System.ComponentModel;
+using System.Runtime.CompilerServices;
 using System.Threading;
-using Mono.Ssdp.Internal;
-using MonoTorrent.Common;
 
 namespace MonoTorrent.Client
 {
-	public delegate void MainLoopResult (object result);
-    public delegate object MainLoopJob();
-    public delegate void MainLoopTask();
-    public delegate bool TimeoutTask();
-
-    public class MainLoop
+    class MainLoop : SynchronizationContext, INotifyCompletion
     {
-        private class DelegateTask : ICacheable
+        static readonly ICache<CacheableManualResetEventSlim> cache = new Cache<CacheableManualResetEventSlim> (true).Synchronize ();
+
+        struct QueuedTask
         {
-            private ManualResetEvent handle;
-            private bool isBlocking;
-            private MainLoopJob job;
-            private object jobResult;
-            private Exception storedException;
-            private MainLoopTask task;
-            private TimeoutTask timeout;
-            private bool timeoutResult;
+            public Action Action;
 
-            public bool IsBlocking
-            {
-                get { return isBlocking; }
-                set { isBlocking = value; }
-            }
+            public SendOrPostCallback SendOrPostCallback;
+            public object State;
 
-            public MainLoopJob Job
-            {
-                get { return job; }
-                set { job = value; }
-            }
+            public ManualResetEventSlim WaitHandle;
+        }
 
-            public Exception StoredException
+        class CacheableManualResetEventSlim : ManualResetEventSlim, ICacheable
+        {
+            public void Initialise ()
             {
-                get { return storedException; }
-                set { storedException = value; }
-            }
-
-            public MainLoopTask Task
-            {
-                get { return task; }
-                set { task = value; }
-            }
-
-            public TimeoutTask Timeout
-            {
-                get { return timeout; }
-                set { timeout = value; }
-            }
-
-            public object JobResult
-            {
-                get { return jobResult; }
-            }
-
-            public bool TimeoutResult
-            {
-                get { return timeoutResult; }
-            }
-
-            public ManualResetEvent WaitHandle
-            {
-                get { return handle; }
-            }
-
-            public DelegateTask()
-            {
-                handle = new ManualResetEvent(false);
-            }
-            
-            public void Execute()
-            {
-                try
-                {
-                    if (job != null)
-                        jobResult = job();
-                    else if (task != null)
-                        task();
-                    else if (timeout != null)
-                        timeoutResult = timeout();
-                }
-                catch (Exception ex)
-                {
-                    storedException = ex;
-
-                    // FIXME: I assume this case can't happen. The only user interaction
-                    // with the mainloop is with blocking tasks. Internally it's a big bug
-                    // if i allow an exception to propagate to the mainloop.
-                    if (!IsBlocking)
-                        throw;
-                }
-                finally
-                {
-                    handle.Set();
-                }
-            }
-
-            public void Initialise()
-            {
-                isBlocking = false;
-                job = null;
-                jobResult = null;
-                storedException = null;
-                task = null;
-                timeout = null;
-                timeoutResult = false;
+                Reset ();
             }
         }
 
-        TimeoutDispatcher dispatcher = new TimeoutDispatcher();
-        AutoResetEvent handle = new AutoResetEvent(false);
-        ICache<DelegateTask> cache = new Cache<DelegateTask>(true).Synchronize();
-        Queue<DelegateTask> tasks = new Queue<DelegateTask>();
-        internal Thread thread;
+        readonly Queue<QueuedTask> actions = new Queue<QueuedTask> ();
+        readonly ManualResetEventSlim actionsWaiter = new ManualResetEventSlim ();
+        readonly Thread thread;
 
-        public MainLoop(string name)
+        public MainLoop (string name)
         {
-            thread = new Thread(Loop);
-            thread.IsBackground = true;
-            thread.Start();
-        }
-
-        void Loop()
-        {
-            while (true)
-            {
-                DelegateTask task = null;
-                
-                lock (tasks)
-                {
-                    if (tasks.Count > 0)
-                        task = tasks.Dequeue();
-                }
-
-                if (task == null)
-                {
-                    handle.WaitOne();
-                }
-                else
-                {
-                    bool reuse = !task.IsBlocking;
-                    task.Execute();
-                    if (reuse)
-                        cache.Enqueue(task);
-                }
-            }
-        }
-
-        private void Queue(DelegateTask task)
-        {
-            Queue(task, Priority.Normal);
-        }
-
-        private void Queue(DelegateTask task, Priority priority)
-        {
-            lock (tasks)
-            {
-                tasks.Enqueue(task);
-                handle.Set();
-            }
-        }
-
-        public void Queue(MainLoopTask task)
-        {
-            DelegateTask dTask = cache.Dequeue();
-            dTask.Task = task;
-            Queue(dTask);
-        }
-
-        public void QueueWait(MainLoopTask task)
-        {
-            DelegateTask dTask = cache.Dequeue();
-            dTask.Task = task;
-            try
-            {
-                QueueWait(dTask);
-            }
-            finally
-            {
-                cache.Enqueue(dTask);
-            }
-        }
-
-        public object QueueWait(MainLoopJob task)
-        {
-            DelegateTask dTask = cache.Dequeue();
-            dTask.Job = task;
-
-            try
-            {
-                QueueWait(dTask);
-                return dTask.JobResult;
-            }
-            finally
-            {
-                cache.Enqueue(dTask);
-            }
-        }
-
-        private void QueueWait(DelegateTask t)
-        {
-            t.WaitHandle.Reset();
-            t.IsBlocking = true;
-            if (Thread.CurrentThread == thread)
-                t.Execute();
-            else
-                Queue(t, Priority.Highest);
-
-            t.WaitHandle.WaitOne();
-
-            if (t.StoredException != null)
-                throw new TorrentException("Exception in mainloop", t.StoredException);
-        }
-
-        public uint QueueTimeout(TimeSpan span, TimeoutTask task)
-        {
-            DelegateTask dTask = cache.Dequeue();
-            dTask.Timeout = task;
-
-            return dispatcher.Add(span, delegate {
-                QueueWait(dTask);
-                return dTask.TimeoutResult;
-            });
-        }
-
-        public AsyncCallback Wrap(AsyncCallback callback)
-        {
-            return delegate(IAsyncResult result) {
-                Queue(delegate {
-                    callback(result);
-                });
+            thread = new Thread (Loop) {
+                Name = name,
+                IsBackground = true
             };
+            thread.Start ();
         }
+
+        void Loop ()
+        {
+            SetSynchronizationContext (this);
+#if ALLOW_EXECUTION_CONTEXT_SUPPRESSION
+            using (ExecutionContext.SuppressFlow ())
+#endif
+                while (true) {
+                    QueuedTask? task = null;
+
+                    lock (actions) {
+                        if (actions.Count > 0)
+                            task = actions.Dequeue ();
+                        else
+                            actionsWaiter.Reset ();
+                    }
+
+                    if (!task.HasValue) {
+                        actionsWaiter.Wait ();
+                    } else {
+                        try {
+                            task.Value.Action?.Invoke ();
+                            task.Value.SendOrPostCallback?.Invoke (task.Value.State);
+                        } catch (Exception ex) {
+                            Console.WriteLine ("Unexpected main loop exception: {0}", ex);
+                        } finally {
+                            task.Value.WaitHandle?.Set ();
+                        }
+                    }
+                }
+        }
+
+        public void QueueWait (Action action)
+        {
+            Send (t => action (), null);
+        }
+
+        public object QueueWait (Func<object> func)
+        {
+            object result = null;
+            Send (t => result = func (), null);
+            return result;
+        }
+
+        public void QueueTimeout (TimeSpan span, Func<bool> task)
+        {
+            if (span.TotalMilliseconds < 1)
+                span = TimeSpan.FromMilliseconds (1);
+            bool disposed = false;
+            Timer timer = null;
+
+            void Callback (object state)
+            {
+                if (!disposed && !task ()) {
+                    disposed = true;
+                    timer.Dispose ();
+                }
+            }
+
+            timer = new Timer (state => {
+                Post (Callback, null);
+            }, null, span, span);
+        }
+
+        void Queue (QueuedTask task)
+        {
+            bool shouldSet = false;
+            lock (actions) {
+                actions.Enqueue (task);
+                if (actions.Count == 1)
+                    shouldSet = true;
+            }
+
+            if (shouldSet)
+                actionsWaiter.Set ();
+        }
+
+        [EditorBrowsable (EditorBrowsableState.Never)]
+        public override void Post (SendOrPostCallback d, object state)
+        {
+            Queue (new QueuedTask { SendOrPostCallback = d, State = state });
+        }
+
+        [EditorBrowsable (EditorBrowsableState.Never)]
+        public override void Send (SendOrPostCallback d, object state)
+        {
+            if (thread == Thread.CurrentThread) {
+                d (state);
+            } else {
+                CacheableManualResetEventSlim waiter = cache.Dequeue ();
+                Queue (new QueuedTask { SendOrPostCallback = d, State = state, WaitHandle = waiter });
+                waiter.Wait ();
+                cache.Enqueue (waiter);
+            }
+        }
+
+#region If you await the MainLoop you'll swap to it's thread!
+        [EditorBrowsable (EditorBrowsableState.Never)]
+        public MainLoop GetAwaiter ()
+        {
+            return this;
+        }
+
+        [EditorBrowsable (EditorBrowsableState.Never)]
+        public bool IsCompleted => thread == Thread.CurrentThread;
+
+        [EditorBrowsable (EditorBrowsableState.Never)]
+        public void GetResult ()
+        {
+
+        }
+
+        [EditorBrowsable (EditorBrowsableState.Never)]
+        public void OnCompleted (Action continuation)
+        {
+            Queue (new QueuedTask { Action = continuation });
+        }
+
+        /// <summary>
+        /// When <see cref="ThreadSwitcher"/> is awaited the continuation will be executed
+        /// on the threadpool. If you are already on a threadpool thread the continuation
+        /// will execute synchronously.
+        /// </summary>
+        /// <returns></returns>
+        public static EnsureThreadPool SwitchToThreadpool ()
+        {
+            return new EnsureThreadPool ();
+        }
+
+        /// <summary>
+        /// When <see cref="ThreadSwitcher"/> is awaited the continuation will always be queued on
+        /// the ThreadPool for execution. It will never execute synchronously.
+        /// </summary>
+        /// <returns></returns>
+        public static ThreadSwitcher SwitchThread ()
+        {
+            return new ThreadSwitcher ();
+        }
+
+#endregion
     }
 }

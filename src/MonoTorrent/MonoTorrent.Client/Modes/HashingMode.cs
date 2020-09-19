@@ -1,108 +1,121 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Text;
-using MonoTorrent.Common;
-using System.Threading;
+﻿//
+// HashingMode.cs
+//
+// Authors:
+//   Alan McGovern alan.mcgovern@gmail.com
+//
+// Copyright (C) 2009 Alan McGovern
+//
+// Permission is hereby granted, free of charge, to any person obtaining
+// a copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to
+// permit persons to whom the Software is furnished to do so, subject to
+// the following conditions:
+// 
+// The above copyright notice and this permission notice shall be
+// included in all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+//
 
-namespace MonoTorrent.Client
+
+using System.Linq;
+using System.Threading.Tasks;
+
+namespace MonoTorrent.Client.Modes
 {
-	class HashingMode : Mode
-	{
-		internal ManualResetEvent hashingWaitHandle;
+    class HashingMode : Mode
+    {
 
-		bool autostart;
-		bool filesExist;
-		int index = -1;
-        MainLoopResult pieceCompleteCallback;
+        TaskCompletionSource<object> PausedCompletionSource { get; set; }
 
-		public override TorrentState State
-		{
-			get { return TorrentState.Hashing; }
-		}
+        public override bool CanAcceptConnections => false;
+        public override bool CanHandleMessages => false;
+        public override bool CanHashCheck => false;
+        public override TorrentState State => PausedCompletionSource.Task.IsCompleted ? TorrentState.Hashing : TorrentState.HashingPaused;
 
-		public HashingMode(TorrentManager manager, bool autostart)
-			: base(manager)
-		{
-			CanAcceptConnections = false;
-			this.hashingWaitHandle = new ManualResetEvent(false);
-			this.autostart = autostart;
-			this.filesExist = Manager.HasMetadata && manager.Engine.DiskManager.CheckAnyFilesExist(Manager);
-            this.pieceCompleteCallback = PieceComplete;
-		}
+        public HashingMode (TorrentManager manager, DiskManager diskManager, ConnectionManager connectionManager, EngineSettings settings)
+            : base (manager, diskManager, connectionManager, settings)
+        {
+            // Mark it as completed so we are *not* paused by default;
+            PausedCompletionSource = new TaskCompletionSource<object> ();
+            PausedCompletionSource.TrySetResult (null);
+        }
 
-		private void QueueNextHash()
-		{
-			if (Manager.Mode != this || index == Manager.Torrent.Pieces.Count)
-				HashingComplete();
-			else
-				Manager.Engine.DiskManager.BeginGetHash(Manager, index, pieceCompleteCallback);
-		}
+        public void Pause ()
+        {
+            if (State == TorrentState.HashingPaused)
+                return;
 
-		private void PieceComplete(object hash)
-		{
-			if (Manager.Mode != this)
-			{
-				HashingComplete();
-			}
-			else
-			{
-				Manager.Bitfield[index] = hash == null ? false : Manager.Torrent.Pieces.IsValid((byte[])hash, index);
-				Manager.RaisePieceHashed(new PieceHashedEventArgs(Manager, index, Manager.Bitfield[index]));
-				index++;
-				QueueNextHash();
-			}
-		}
+            PausedCompletionSource?.TrySetResult (null);
+            PausedCompletionSource = new TaskCompletionSource<object> ();
+            Cancellation.Token.Register (() => PausedCompletionSource.TrySetCanceled ());
+            Manager.RaiseTorrentStateChanged (new TorrentStateChangedEventArgs (Manager, TorrentState.HashingPaused, State));
+        }
 
-		private void HashingComplete()
-		{
-			Manager.HashChecked = index == Manager.Torrent.Pieces.Count;
+        public void Resume ()
+        {
+            if (State == TorrentState.Hashing)
+                return;
 
-			if (Manager.HasMetadata && !Manager.HashChecked)
-			{
-				Manager.Bitfield.SetAll(false);
-				for (int i = 0; i < Manager.Torrent.Pieces.Count; i++)
-					Manager.RaisePieceHashed(new PieceHashedEventArgs(Manager, i, false));
-			}
+            PausedCompletionSource.TrySetResult (null);
+            Manager.RaiseTorrentStateChanged (new TorrentStateChangedEventArgs (Manager, TorrentState.Hashing, State));
+        }
 
-			if (Manager.Engine != null && filesExist)
-				Manager.Engine.DiskManager.CloseFileStreams(Manager);
+        public async Task WaitForHashingToComplete ()
+        {
+            if (!Manager.HasMetadata)
+                throw new TorrentException ("A hash check cannot be performed if TorrentManager.HasMetadata is false.");
 
-			hashingWaitHandle.Set();
+            // Ensure the partial progress selector is up to date before we start hashing
+            UpdatePartialProgress ();
 
-			if (!Manager.HashChecked)
-				return;
+            int piecesHashed = 0;
+            Manager.HashFails = 0;
+            if (await DiskManager.CheckAnyFilesExistAsync (Manager)) {
+                Cancellation.Token.ThrowIfCancellationRequested ();
+                for (int index = 0; index < Manager.Torrent.Pieces.Count; index++) {
+                    if (!Manager.Files.Any (f => index >= f.StartPieceIndex && index <= f.EndPieceIndex && f.Priority != Priority.DoNotDownload)) {
+                        // If a file is marked 'do not download' ensure we update the TorrentFiles
+                        // so they also report that the piece is not available/downloaded.
+                        Manager.OnPieceHashed (index, false, piecesHashed, Manager.PartialProgressSelector.TrueCount);
+                        // Then mark this piece as being unhashed so we don't try to download it.
+                        Manager.UnhashedPieces[index] = true;
+                        continue;
+                    }
 
-			if (autostart)
-			{
-				Manager.Start();
-			}
-			else
-			{
-				Manager.Mode = new StoppedMode(Manager);
-			}
-		}
+                    await PausedCompletionSource.Task;
+                    Cancellation.Token.ThrowIfCancellationRequested ();
 
-		public override void HandlePeerConnected(PeerId id, MonoTorrent.Common.Direction direction)
-		{
-			id.CloseConnection();
-		}
+                    byte[] hash = await DiskManager.GetHashAsync (Manager, index);
 
-		public override void Tick(int counter)
-		{
-            if (!filesExist)
-            {
-                Manager.Bitfield.SetAll(false);
+                    if (Cancellation.Token.IsCancellationRequested) {
+                        await DiskManager.CloseFilesAsync (Manager);
+                        Cancellation.Token.ThrowIfCancellationRequested ();
+                    }
+
+                    bool hashPassed = hash != null && Manager.Torrent.Pieces.IsValid (hash, index);
+                    Manager.OnPieceHashed (index, hashPassed, ++piecesHashed, Manager.PartialProgressSelector.TrueCount);
+                }
+            } else {
+                await PausedCompletionSource.Task;
+
                 for (int i = 0; i < Manager.Torrent.Pieces.Count; i++)
-                    Manager.RaisePieceHashed(new PieceHashedEventArgs(Manager, i, false));
-                index = Manager.Torrent.Pieces.Count;
-                HashingComplete();
+                    Manager.OnPieceHashed (i, false, ++piecesHashed, Manager.Torrent.Pieces.Count);
             }
-            else if (index == -1)
-			{
-				index++;
-				QueueNextHash();
-			}
-			// Do nothing in hashing mode
-		}
-	}
+        }
+
+        public override void Tick (int counter)
+        {
+            // Do not run any of the default 'Tick' logic as nothing happens during 'Hashing' mode, except for hashing.
+        }
+    }
 }

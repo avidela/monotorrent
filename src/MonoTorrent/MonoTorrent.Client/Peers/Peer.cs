@@ -27,187 +27,154 @@
 //
 
 
-
 using System;
-using System.Text;
-using System.Net;
-using MonoTorrent.Common;
-using MonoTorrent.BEncoding;
-using MonoTorrent.Client.Encryption;
 using System.Collections.Generic;
+using System.Net;
+using System.Text;
+
+using MonoTorrent.BEncoding;
+using MonoTorrent.Client.Messages;
 
 namespace MonoTorrent.Client
 {
-    public class Peer
+    public class Peer : IEquatable<Peer>
     {
-        #region Private Fields
+        /// <summary>
+        /// The number of times this peer has had it's connection closed
+        /// </summary>
+        internal int CleanedUpCount { get; set; }
 
-        private int cleanedUpCount;
-        private Uri connectionUri;
-        private EncryptionTypes encryption;
-        private int failedConnectionAttempts;
-        private int localPort;
-        private int totalHashFails;
-        private bool isSeeder;
-        private string peerId;
-        private int repeatedHashFails;
-        private DateTime lastConnectionAttempt;
+        /// <summary>
+        /// The URI used to make an outgoing connection to this peer.
+        /// </summary>
+        public Uri ConnectionUri { get; }
 
-        #endregion Private Fields
+        /// <summary>
+        /// The types of encryption the peer supports. Initially this is set to <see cref="EncryptionTypes.All"/>.
+        /// <see cref="EncryptionTypes.RC4Full"/> and <see cref="EncryptionTypes.RC4Header"/> different methods
+        /// are removed if a connection cannot be established using that method. For example if PlainText connections
+        /// appear to be rejected by the remote peer, it will be removed from the set so only encrypted connections
+        /// will be tried during the next connection attempt.
+        /// </summary>
+        public EncryptionTypes AllowedEncryption { get; internal set; }
 
+        /// <summary>
+        /// The number of times we failed to establish an outgoing connection to this peer.
+        /// </summary>
+        internal int FailedConnectionAttempts { get; set; }
 
-        #region Properties
+        /// <summary>
+        /// A cache of the last known seeding state of this peer. This is used to avoid connecting to seeders when 100%
+        /// of the torrent has been downloaded.
+        /// </summary>
+        internal bool IsSeeder { get; set; }
 
-        public Uri ConnectionUri
-        {
-            get { return connectionUri; }
-        }
+        /// <summary>
+        /// The local port this peer is listening for connections on.
+        /// </summary>
+        internal int LocalPort { get; set; }
 
-        internal int CleanedUpCount
-        {
-            get { return this.cleanedUpCount; }
-            set { this.cleanedUpCount = value; }
-        }
+        /// <summary>
+        /// A stale peer is one which came from an old announce/DHT/peer exchange request. These
+        /// peers may still be contactable, but if a new peer is provided via one of the normal
+        /// mechanisms then the new peer should replace any stale peers in the event the torrent
+        /// is already holding the maximum number of peers.
+        /// </summary>
+        internal bool MaybeStale { get; set; }
 
-        public EncryptionTypes Encryption
-        {
-            get { return encryption; }
-            set { encryption = value; }
-        }
+        /// <summary>
+        /// The 20 byte identifier for the peer.
+        /// </summary>
+        internal BEncodedString PeerId { get; set; }
 
-        internal int TotalHashFails
-        {
-            get { return this.totalHashFails; }
-        }
+        /// <summary>
+        /// The number of times, in a row, that this peer has sent us the blocks for a piece and that
+        /// piece failed the hash check.
+        /// </summary>
+        internal int RepeatedHashFails { get; set; }
 
-        internal string PeerId
-        {
-            get { return peerId; }
-            set { peerId = value; }
-        }
-
-        internal bool IsSeeder
-        {
-            get { return this.isSeeder; }
-            set { this.isSeeder = value; }
-        }
-
-        internal int FailedConnectionAttempts
-        {
-            get { return this.failedConnectionAttempts; }
-            set { this.failedConnectionAttempts = value; }
-        }
-
-        internal int LocalPort
-        {
-            get { return localPort; }
-            set { localPort = value; }
-        }
-
-        internal DateTime LastConnectionAttempt
-        {
-            get { return this.lastConnectionAttempt; }
-            set { this.lastConnectionAttempt = value; }
-        }
-
-        internal int RepeatedHashFails
-        {
-            get { return this.repeatedHashFails; }
-        }
-
-        #endregion Properties
+        /// <summary>
+        /// This is the overall count for the number of pieces which failed the hash check after being
+        /// received from this peer.
+        /// </summary>
+        internal int TotalHashFails { get; set; }
 
 
-        #region Constructors
-
-        public Peer(string peerId, Uri connectionUri)
+        public Peer (BEncodedString peerId, Uri connectionUri)
             : this (peerId, connectionUri, EncryptionTypes.All)
         {
 
         }
 
-        public Peer(string peerId, Uri connectionUri, EncryptionTypes encryption)
+        public Peer (BEncodedString peerId, Uri connectionUri, EncryptionTypes allowedEncryption)
         {
-            if (peerId == null)
-                throw new ArgumentNullException("peerId");
-            if (connectionUri == null)
-                throw new ArgumentNullException("connectionUri");
-
-            this.connectionUri = connectionUri;
-            this.encryption = encryption;
-            this.peerId = peerId;
+            PeerId = peerId ?? throw new ArgumentNullException (nameof (peerId));
+            ConnectionUri = connectionUri ?? throw new ArgumentNullException (nameof (connectionUri));
+            AllowedEncryption = allowedEncryption;
         }
 
-        #endregion
-
-
-        public override bool Equals(object obj)
+        public override bool Equals (object obj)
         {
-            return Equals(obj as Peer);
+            return Equals (obj as Peer);
         }
 
-        public bool Equals(Peer other)
+        public bool Equals (Peer other)
         {
             if (other == null)
                 return false;
 
             // FIXME: Don't compare the port, just compare the IP
-            if (string.IsNullOrEmpty(peerId) && string.IsNullOrEmpty(other.peerId))
-                return this.connectionUri.Host.Equals(other.connectionUri.Host);
+            if (BEncodedString.IsNullOrEmpty (PeerId) || BEncodedString.IsNullOrEmpty (other.PeerId))
+                return ConnectionUri.Equals (other.ConnectionUri);
 
-            return peerId == other.peerId;
+            return PeerId.Equals (other.PeerId);
         }
 
-        public override int GetHashCode()
+        public override int GetHashCode ()
         {
-            return this.connectionUri.Host.GetHashCode();
+            return PeerId?.GetHashCode () ?? ConnectionUri.GetHashCode ();
         }
 
-        public override string ToString()
-        {
-            return this.connectionUri.ToString();
-        }
-
-        internal byte[] CompactPeer()
+        internal byte[] CompactPeer ()
         {
             byte[] data = new byte[6];
-            CompactPeer(data, 0);
+            CompactPeer (data, 0);
             return data;
         }
 
-        internal void CompactPeer(byte[] data, int offset)
+        internal void CompactPeer (byte[] data, int offset)
         {
-            Buffer.BlockCopy(IPAddress.Parse(this.connectionUri.Host).GetAddressBytes(), 0, data, offset, 4);
-            Buffer.BlockCopy(BitConverter.GetBytes(IPAddress.HostToNetworkOrder(((short)this.connectionUri.Port))), 0, data, offset + 4, 2);
+            Buffer.BlockCopy (IPAddress.Parse (ConnectionUri.Host).GetAddressBytes (), 0, data, offset, 4);
+            Message.Write (data, offset + 4, (short) ConnectionUri.Port);
         }
 
-        internal void HashedPiece(bool succeeded)
+        internal void HashedPiece (bool succeeded)
         {
-            if (succeeded && repeatedHashFails > 0)
-                repeatedHashFails--;
-            
-            if (!succeeded)
-            {
-                repeatedHashFails++;
-                totalHashFails++;
+            if (succeeded && RepeatedHashFails > 0)
+                RepeatedHashFails--;
+
+            if (!succeeded) {
+                RepeatedHashFails++;
+                TotalHashFails++;
             }
         }
 
-        public static MonoTorrentCollection<Peer> Decode(BEncodedList peers)
+        public override string ToString ()
         {
-            MonoTorrentCollection<Peer> list = new MonoTorrentCollection<Peer>(peers.Count);
-            foreach (BEncodedValue value in peers)
-            {
-                try
-                {
+            return ConnectionUri.ToString ();
+        }
+
+        public static IList<Peer> Decode (BEncodedList peers)
+        {
+            var list = new List<Peer> (peers.Count);
+            foreach (BEncodedValue value in peers) {
+                try {
                     if (value is BEncodedDictionary)
-                        list.Add(DecodeFromDict((BEncodedDictionary)value));
+                        list.Add (DecodeFromDict ((BEncodedDictionary) value));
                     else if (value is BEncodedString)
-                        foreach (Peer p in Decode((BEncodedString)value))
-                            list.Add(p);
-                }
-                catch
-                {
+                        foreach (Peer p in Decode ((BEncodedString) value))
+                            list.Add (p);
+                } catch {
                     // If something is invalid and throws an exception, ignore it
                     // and continue decoding the rest of the peers
                 }
@@ -215,61 +182,65 @@ namespace MonoTorrent.Client
             return list;
         }
 
-        private static Peer DecodeFromDict(BEncodedDictionary dict)
+        static Peer DecodeFromDict (BEncodedDictionary dict)
         {
-            string peerId;
+            BEncodedString peerId;
 
-            if (dict.ContainsKey("peer id"))
-                peerId = dict["peer id"].ToString();
-            else if (dict.ContainsKey("peer_id"))       // HACK: Some trackers return "peer_id" instead of "peer id"
-                peerId = dict["peer_id"].ToString();
+            if (dict.ContainsKey ("peer id"))
+                peerId = (BEncodedString) dict["peer id"];
+            else if (dict.ContainsKey ("peer_id"))       // HACK: Some trackers return "peer_id" instead of "peer id"
+                peerId = (BEncodedString) dict["peer_id"];
             else
-                peerId = string.Empty;
+                peerId = BEncodedString.Empty;
 
-            Uri connectionUri = new Uri("tcp://" + dict["ip"].ToString() + ":" + dict["port"].ToString());
-            return new Peer(peerId, connectionUri, EncryptionTypes.All);
+            var connectionUri = new Uri ($"ipv4://{dict["ip"]}:{dict["port"]}");
+            return new Peer (peerId, connectionUri, EncryptionTypes.All);
         }
 
-        public static MonoTorrentCollection<Peer> Decode(BEncodedString peers)
+        public static IList<Peer> Decode (BEncodedString peers)
+        {
+            return FromCompact (peers.TextBytes, 0);
+        }
+
+        internal static BEncodedList Encode (IEnumerable<Peer> peers)
+        {
+            var list = new BEncodedList ();
+            foreach (Peer p in peers)
+                list.Add ((BEncodedString) p.CompactPeer ());
+            return list;
+        }
+
+        internal static IList<Peer> FromCompact (byte[] data, int offset)
         {
             // "Compact Response" peers are encoded in network byte order. 
             // IP's are the first four bytes
             // Ports are the following 2 bytes
-            byte[] byteOrderedData = peers.TextBytes;
-            int i = 0;
-            UInt16 port;
-            StringBuilder sb = new StringBuilder(27);
-            MonoTorrentCollection<Peer> list = new MonoTorrentCollection<Peer>((byteOrderedData.Length / 6) + 1);
-            while ((i + 5) < byteOrderedData.Length)
-            {
-                sb.Remove(0, sb.Length);
+            byte[] byteOrderedData = data;
+            int i = offset;
+            ushort port;
+            var sb = new StringBuilder (27);
+            var list = new List<Peer> ((byteOrderedData.Length / 6) + 1);
+            while ((i + 5) < byteOrderedData.Length) {
+                sb.Remove (0, sb.Length);
 
-                sb.Append("tcp://");
-                sb.Append(byteOrderedData[i++]);
-                sb.Append('.');
-                sb.Append(byteOrderedData[i++]);
-                sb.Append('.');
-                sb.Append(byteOrderedData[i++]);
-                sb.Append('.');
-                sb.Append(byteOrderedData[i++]);
+                sb.Append ("ipv4://");
+                sb.Append (byteOrderedData[i++]);
+                sb.Append ('.');
+                sb.Append (byteOrderedData[i++]);
+                sb.Append ('.');
+                sb.Append (byteOrderedData[i++]);
+                sb.Append ('.');
+                sb.Append (byteOrderedData[i++]);
 
-                port = (UInt16)IPAddress.NetworkToHostOrder(BitConverter.ToInt16(byteOrderedData, i));
+                port = (ushort) IPAddress.NetworkToHostOrder (BitConverter.ToInt16 (byteOrderedData, i));
                 i += 2;
-                sb.Append(':');
-                sb.Append(port);
+                sb.Append (':');
+                sb.Append (port);
 
-                Uri uri = new Uri(sb.ToString());
-                list.Add(new Peer("", uri, EncryptionTypes.All));
+                var uri = new Uri (sb.ToString ());
+                list.Add (new Peer ("", uri, EncryptionTypes.All));
             }
 
-            return list;
-        }
-
-        internal static BEncodedList Encode(IEnumerable<Peer> peers)
-        {
-            BEncodedList list = new BEncodedList();
-            foreach (Peer p in peers)
-                list.Add((BEncodedString)p.CompactPeer());
             return list;
         }
     }

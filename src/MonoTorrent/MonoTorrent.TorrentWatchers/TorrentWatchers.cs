@@ -27,24 +27,21 @@
 //
 
 
-using System;
 using System.Collections.Generic;
-using MonoTorrent.Common;
 
 namespace MonoTorrent.TorrentWatcher
 {
     /// <summary>
     /// Main controller class for ITorrentWatcher
     /// </summary>
-    public class TorrentWatchers : MonoTorrentCollection<ITorrentWatcher>
+    public class TorrentWatchers : List<ITorrentWatcher>
     {
         #region Constructors
 
         /// <summary>
         /// 
         /// </summary>
-        /// <param name="settings"></param>
-        public TorrentWatchers()
+        public TorrentWatchers ()
         {
 
         }
@@ -57,30 +54,30 @@ namespace MonoTorrent.TorrentWatcher
         /// <summary>
         /// 
         /// </summary>
-        public void StartAll()
+        public void StartAll ()
         {
             for (int i = 0; i < Count; i++)
-                this[i].Start();
+                this[i].Start ();
         }
 
 
         /// <summary>
         /// 
         /// </summary>
-        public void StopAll()
+        public void StopAll ()
         {
             for (int i = 0; i < Count; i++)
-                this[i].Stop();
+                this[i].Stop ();
         }
 
 
         /// <summary>
         /// 
         /// </summary>
-        public void ForceScanAll()
+        public void ForceScanAll ()
         {
             for (int i = 0; i < Count; i++)
-                this[i].ForceScan();
+                this[i].ForceScan ();
         }
 
         #endregion

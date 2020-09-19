@@ -1,56 +1,92 @@
-﻿using System;
+﻿//
+// StoppingMode.cs
+//
+// Authors:
+//   Alan McGovern <alan.mcgovern@gmail.com>
+//
+// Copyright (C) 2008 Alan McGovern
+//
+// Permission is hereby granted, free of charge, to any person obtaining
+// a copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to
+// permit persons to whom the Software is furnished to do so, subject to
+// the following conditions:
+// 
+// The above copyright notice and this permission notice shall be
+// included in all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+//
+
+
+using System;
 using System.Collections.Generic;
-using System.Text;
-using MonoTorrent.Common;
+using System.Threading;
+using System.Threading.Tasks;
 
-namespace MonoTorrent.Client
+using MonoTorrent.Client.Tracker;
+using MonoTorrent.Logging;
+
+namespace MonoTorrent.Client.Modes
 {
-	class StoppingMode : Mode
-	{
-		WaitHandleGroup handle = new WaitHandleGroup();
+    class StoppingMode : Mode
+    {
+        static readonly Logger logger = Logger.Create ();
 
-		public override TorrentState State
-		{
-			get { return TorrentState.Stopping; }
-		}
+        public override bool CanAcceptConnections => false;
+        public override bool CanHandleMessages => false;
+        public override bool CanHashCheck => false;
+        public override TorrentState State => TorrentState.Stopping;
 
-		public StoppingMode(TorrentManager manager)
-			: base(manager)
-		{
-			CanAcceptConnections = false;
-			ClientEngine engine = manager.Engine;
-			if (manager.Mode is HashingMode)
-				handle.AddHandle(((HashingMode)manager.Mode).hashingWaitHandle, "Hashing");
+        public StoppingMode (TorrentManager manager, DiskManager diskManager, ConnectionManager connectionManager, EngineSettings settings)
+            : base (manager, diskManager, connectionManager, settings)
+        {
+        }
 
-			if (manager.TrackerManager.CurrentTracker != null && manager.TrackerManager.CurrentTracker.Status == TrackerState.Ok)
-				handle.AddHandle(manager.TrackerManager.Announce(TorrentEvent.Stopped), "Announcing");
+        public Task WaitForStoppingToComplete ()
+        {
+            return WaitForStoppingToComplete (Timeout.InfiniteTimeSpan);
+        }
 
-			foreach (PeerId id in manager.Peers.ConnectedPeers)
-				if (id.Connection != null)
-					id.Connection.Dispose();
+        public async Task WaitForStoppingToComplete (TimeSpan timeout)
+        {
+            try {
+                Manager.Engine.ConnectionManager.CancelPendingConnects (Manager);
+                foreach (PeerId id in Manager.Peers.ConnectedPeers.ToArray ())
+                    Manager.Engine.ConnectionManager.CleanupSocket (Manager, id);
 
-			manager.Peers.ClearAll();
+                Manager.Monitor.Reset ();
+                Manager.PieceManager.Reset ();
+                Manager.finishedPieces.Clear ();
 
-			handle.AddHandle(engine.DiskManager.CloseFileStreams(manager), "DiskManager");
+                var stoppingTasks = new List<Task> ();
+                // We could be in metadata download mode
+                if (Manager.Torrent != null)
+                    stoppingTasks.Add (Manager.Engine.DiskManager.CloseFilesAsync (Manager));
 
-			manager.Monitor.Reset();
-			manager.PieceManager.Reset();
-			engine.ConnectionManager.CancelPendingConnects(manager);
-			engine.Stop();
-		}
+                Task announceTask = Manager.TrackerManager.AnnounceAsync (TorrentEvent.Stopped, CancellationToken.None).AsTask ();
+                if (timeout != Timeout.InfiniteTimeSpan)
+                    announceTask = Task.WhenAny (announceTask, Task.Delay (timeout));
+                stoppingTasks.Add (announceTask);
 
-		public override void HandlePeerConnected(PeerId id, MonoTorrent.Common.Direction direction)
-		{
-			id.CloseConnection();
-		}
-
-		public override void Tick(int counter)
-		{
-			if (handle.WaitOne(0, true))
-			{
-				handle.Close();
-				Manager.Mode = new StoppedMode(Manager);
-			}
-		}
-	}
+                // FIXME: Expose CancellationToken throughout this API.
+                var delayTask = Task.Delay (TimeSpan.FromMinutes (1), Cancellation.Token);
+                var overallTasks = Task.WhenAll (stoppingTasks);
+                if (await Task.WhenAny (overallTasks, delayTask) == delayTask)
+                    logger.Error ("Timed out waiting for the announce request to complete");
+                else
+                    await overallTasks;
+            } catch (Exception ex) {
+                logger.Exception (ex, "Unexpected exception while stopping");
+            }
+        }
+    }
 }

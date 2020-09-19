@@ -27,11 +27,6 @@
 //
 
 
-
-using System;
-using System.Net.Sockets;
-using MonoTorrent.Common;
-
 namespace MonoTorrent.Client
 {
     /// <summary>
@@ -41,64 +36,45 @@ namespace MonoTorrent.Client
     {
         #region Member Variables
 
-        private SpeedMonitor dataDown;
-        private SpeedMonitor dataUp;
-        private object locker = new object();
-        private SpeedMonitor protocolDown;
-        private SpeedMonitor protocolUp;
+        internal SpeedMonitor DataDown { get; }
+        internal SpeedMonitor DataUp { get; }
+        internal SpeedMonitor ProtocolDown { get; }
+        internal SpeedMonitor ProtocolUp { get; }
 
         #endregion Member Variables
 
 
         #region Public Properties
 
-        public long DataBytesDownloaded
-        {
-            get { return dataDown.Total; }
-        }
+        public long DataBytesDownloaded => DataDown.Total;
 
-        public long DataBytesUploaded
-        {
-            get { return dataUp.Total; }
-        }
+        public long DataBytesUploaded => DataUp.Total;
 
-        public int DownloadSpeed
-        {
-            get { return dataDown.Rate + protocolDown.Rate; }
-        }
+        public long DownloadSpeed => DataDown.Rate + ProtocolDown.Rate;
 
-        public long ProtocolBytesDownloaded
-        {
-            get { return protocolDown.Total; }
-        }
+        public long ProtocolBytesDownloaded => ProtocolDown.Total;
 
-        public long ProtocolBytesUploaded
-        {
-            get { return protocolUp.Total; }
-        }
+        public long ProtocolBytesUploaded => ProtocolUp.Total;
 
-        public int UploadSpeed
-        {
-            get { return dataUp.Rate + protocolUp.Rate; }
-        }
+        public long UploadSpeed => DataUp.Rate + ProtocolUp.Rate;
 
         #endregion Public Properties
 
 
         #region Constructors
 
-        internal ConnectionMonitor()
-            : this(12)
+        internal ConnectionMonitor ()
+            : this (12)
         {
 
         }
 
-        internal ConnectionMonitor(int averagingPeriod)
+        internal ConnectionMonitor (int averagingPeriod)
         {
-            dataDown = new SpeedMonitor(averagingPeriod);
-            dataUp = new SpeedMonitor(averagingPeriod);
-            protocolDown = new SpeedMonitor(averagingPeriod);
-            protocolUp = new SpeedMonitor(averagingPeriod);
+            DataDown = new SpeedMonitor (averagingPeriod);
+            DataUp = new SpeedMonitor (averagingPeriod);
+            ProtocolDown = new SpeedMonitor (averagingPeriod);
+            ProtocolUp = new SpeedMonitor (averagingPeriod);
         }
 
         #endregion
@@ -106,48 +82,20 @@ namespace MonoTorrent.Client
 
         #region Methods
 
-        internal void BytesSent(int bytesUploaded, TransferType type)
+        internal void Reset ()
         {
-            lock (locker)
-            {
-                if (type == TransferType.Data)
-                    dataUp.AddDelta(bytesUploaded);
-                else
-                    protocolUp.AddDelta(bytesUploaded);
-            }
+            DataDown.Reset ();
+            DataUp.Reset ();
+            ProtocolDown.Reset ();
+            ProtocolUp.Reset ();
         }
 
-        internal void BytesReceived(int bytesDownloaded, TransferType type)
+        internal void Tick ()
         {
-            lock (locker)
-            {
-                if (type == TransferType.Data)
-                    dataDown.AddDelta(bytesDownloaded);
-                else
-                    protocolDown.AddDelta(bytesDownloaded);
-            }
-        }
-
-        internal void Reset()
-        {
-            lock (locker)
-            {
-                dataDown.Reset();
-                dataUp.Reset();
-                protocolDown.Reset();
-                protocolUp.Reset();
-            }
-        }
-
-        internal void Tick()
-        {
-            lock (locker)
-            {
-                dataDown.Tick();
-                dataUp.Tick();
-                protocolDown.Tick();
-                protocolUp.Tick();
-            }
+            DataDown.Tick ();
+            DataUp.Tick ();
+            ProtocolDown.Tick ();
+            ProtocolUp.Tick ();
         }
 
         #endregion

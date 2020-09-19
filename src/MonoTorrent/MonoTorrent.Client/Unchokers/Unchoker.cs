@@ -27,31 +27,34 @@
 //
 
 
-
-using System;
-using System.Collections.Generic;
-using System.Text;
 using MonoTorrent.Client.Messages.Standard;
 
 namespace MonoTorrent.Client
 {
     abstract class Unchoker : IUnchoker
     {
-        public virtual void Choke(PeerId id)
+        protected TorrentManager Manager { get; }
+
+        protected Unchoker (TorrentManager manager)
         {
-            id.AmChoking = true;
-            id.TorrentManager.UploadingTo--;
-            id.Enqueue(new ChokeMessage());
+            Manager = manager;
         }
 
-        public abstract void UnchokeReview();
-
-        public virtual void Unchoke(PeerId id)
+        public virtual void Choke (PeerId id)
         {
+            Manager.UploadingTo--;
+            id.AmChoking = true;
+            id.MessageQueue.Enqueue (new ChokeMessage ());
+        }
+
+        public abstract void UnchokeReview ();
+
+        public virtual void Unchoke (PeerId id)
+        {
+            Manager.UploadingTo++;
             id.AmChoking = false;
-            id.TorrentManager.UploadingTo++;
-            id.Enqueue(new UnchokeMessage());
-            id.LastUnchoked = DateTime.Now;
+            id.MessageQueue.Enqueue (new UnchokeMessage ());
+            id.LastUnchoked.Restart ();
         }
     }
 }

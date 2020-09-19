@@ -1,353 +1,304 @@
+//
+// TestRig.cs
+//
+// Authors:
+//   Alan McGovern alan.mcgovern@gmail.com
+//
+// Copyright (C) 2008 Alan McGovern
+//
+// Permission is hereby granted, free of charge, to any person obtaining
+// a copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to
+// permit persons to whom the Software is furnished to do so, subject to
+// the following conditions:
+//
+// The above copyright notice and this permission notice shall be
+// included in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+//
+
+
 using System;
 using System.Collections.Generic;
-using System.Text;
-using MonoTorrent.Client.Connections;
-using MonoTorrent.BEncoding;
-using MonoTorrent.Client.Tracker;
-using MonoTorrent.Client.PieceWriters;
-using MonoTorrent.Client;
-using MonoTorrent.Common;
-using System.Net.Sockets;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
 using System.Net;
-using MonoTorrent.Client.Encryption;
+using System.Text;
 using System.Threading;
-using NUnit.Framework;
+using System.Threading.Tasks;
+
+using MonoTorrent.BEncoding;
+using MonoTorrent.Client.Connections;
+using MonoTorrent.Client.Listeners;
+using MonoTorrent.Client.PieceWriters;
+using MonoTorrent.Client.Tracker;
+
+using ReusableTasks;
 
 namespace MonoTorrent.Client
 {
-    public class TestWriter : PieceWriter
+    public class TestWriter : IPieceWriter
     {
-        public List<TorrentFile> FilesThatExist = new List<TorrentFile>();
-        public List<TorrentFile> DoNotReadFrom = new List<TorrentFile>();
+        public List<ITorrentFileInfo> FilesThatExist = new List<ITorrentFileInfo> ();
+        public List<ITorrentFileInfo> DoNotReadFrom = new List<ITorrentFileInfo> ();
         public bool DontWrite;
-        public List<String> Paths = new List<string>();
-        public override int Read(TorrentFile file, long offset, byte[] buffer, int bufferOffset, int count)
+
+        /// <summary>
+        /// this is the list of paths we have read from
+        /// </summary>
+        public List<string> Paths = new List<string> ();
+
+        public ReusableTask<int> ReadAsync (ITorrentFileInfo file, long offset, byte[] buffer, int bufferOffset, int count)
         {
-            if (DoNotReadFrom.Contains(file))
-                return 0;
+            if (DoNotReadFrom.Contains (file))
+                return ReusableTask.FromResult (0);
 
-            if (!Paths.Contains(file.FullPath))
-                Paths.Add(file.FullPath);
+            if (!Paths.Contains (file.FullPath))
+                Paths.Add (file.FullPath);
 
+            if ((offset + count) > file.Length)
+                throw new ArgumentOutOfRangeException ("Tried to read past the end of the file");
             if (!DontWrite)
                 for (int i = 0; i < count; i++)
-                    buffer[bufferOffset + i] = (byte)(bufferOffset + i);
-            return count;
+                    buffer[bufferOffset + i] = (byte) (bufferOffset + i);
+            return ReusableTask.FromResult (count);
         }
 
-        public override void Write(TorrentFile file, long offset, byte[] buffer, int bufferOffset, int count)
+        public ReusableTask WriteAsync (ITorrentFileInfo file, long offset, byte[] buffer, int bufferOffset, int count)
         {
-
+            return ReusableTask.CompletedTask;
         }
 
-        public override void Close(TorrentFile file)
+        public ReusableTask CloseAsync (ITorrentFileInfo file)
         {
-
+            return ReusableTask.CompletedTask;
         }
 
-        public override void Flush(TorrentFile file)
+        public void Dispose ()
         {
-
+            // Nothing
         }
 
-        public override bool Exists(TorrentFile file)
+        public ReusableTask FlushAsync (ITorrentFileInfo file)
         {
-            return FilesThatExist.Contains(file);
+            return ReusableTask.CompletedTask;
         }
 
-        public override void Move(string oldPath, string newPath, bool ignoreExisting)
+        public ReusableTask<bool> ExistsAsync (ITorrentFileInfo file)
         {
-            
+            return ReusableTask.FromResult (FilesThatExist.Contains (file));
+        }
+
+        public ReusableTask MoveAsync (ITorrentFileInfo file, string newPath, bool overwrite)
+        {
+            return ReusableTask.CompletedTask;
         }
     }
 
-    public class CustomTracker : MonoTorrent.Client.Tracker.Tracker
+    class CustomTracker : MonoTorrent.Client.Tracker.Tracker
     {
-        public List<DateTime> AnnouncedAt = new List<DateTime>();
-        public List<DateTime> ScrapedAt = new List<DateTime>();
+        public List<DateTime> AnnouncedAt = new List<DateTime> ();
+        public List<AnnounceParameters> AnnounceParameters = new List<AnnounceParameters> ();
+        public List<DateTime> ScrapedAt = new List<DateTime> ();
 
         public bool FailAnnounce;
         public bool FailScrape;
 
-        public CustomTracker(Uri uri)
-            : base(uri)
+        readonly List<Peer> peers = new List<Peer> ();
+
+        public CustomTracker (Uri uri)
+            : base (uri)
         {
             CanAnnounce = true;
             CanScrape = true;
         }
 
-        public override void Announce(AnnounceParameters parameters, object state)
+        protected override ReusableTask<AnnounceResponse> DoAnnounceAsync (AnnounceParameters parameters, CancellationToken token)
         {
-            RaiseBeforeAnnounce();
-            AnnouncedAt.Add(DateTime.Now);
-            RaiseAnnounceComplete(new AnnounceResponseEventArgs(this, state, !FailAnnounce));
+            AnnouncedAt.Add (DateTime.Now);
+            if (FailAnnounce)
+                throw new TrackerException ("Deliberately failing announce request", null);
+
+            AnnounceParameters.Add (parameters);
+            return ReusableTask.FromResult (new AnnounceResponse (peers, null, null));
         }
 
-        public override void Scrape(ScrapeParameters parameters, object state)
+        protected override ReusableTask<ScrapeResponse> DoScrapeAsync (ScrapeParameters parameters, CancellationToken token)
         {
-            RaiseBeforeScrape();
-            ScrapedAt.Add(DateTime.Now);
-            RaiseScrapeComplete(new ScrapeResponseEventArgs(this, state, !FailScrape));
+            ScrapedAt.Add (DateTime.Now);
+            if (FailScrape)
+                throw new TrackerException ("Deliberately failing scrape request", null);
+
+            return ReusableTask.FromResult (new ScrapeResponse (0, 0, 0));
         }
 
-        public void AddPeer(Peer p)
+        public void AddPeer (Peer peer)
         {
-            TrackerConnectionID id = new TrackerConnectionID(this, false, TorrentEvent.None, new ManualResetEvent(false));
-            AnnounceResponseEventArgs e = new AnnounceResponseEventArgs(this, id, true);
-            e.Peers.Add(p);
-            RaiseAnnounceComplete(e);
-            Assert.IsTrue(id.WaitHandle.WaitOne(1000, true), "#1 Tracker never raised the AnnounceComplete event");
+            peers.Add (peer);
         }
 
-        public void AddFailedPeer(Peer p)
+        public override string ToString ()
         {
-            TrackerConnectionID id = new TrackerConnectionID(this, true, TorrentEvent.None, new ManualResetEvent(false));
-            AnnounceResponseEventArgs e = new AnnounceResponseEventArgs(this, id, false);
-            e.Peers.Add(p);
-            RaiseAnnounceComplete(e);
-            Assert.IsTrue(id.WaitHandle.WaitOne(1000, true), "#2 Tracker never raised the AnnounceComplete event");
-        }
-
-        public override string ToString()
-        {
-            return Uri.ToString();
+            return Uri.ToString ();
         }
     }
 
     public class CustomConnection : IConnection
     {
-        public string Name;
-        public event EventHandler BeginReceiveStarted;
-        public event EventHandler EndReceiveStarted;
+        public byte[] AddressBytes => ((IPEndPoint) EndPoint).Address.GetAddressBytes ();
+        public bool CanReconnect => false;
+        public bool Connected { get; private set; } = true;
+        public EndPoint EndPoint => new IPEndPoint (IPAddress.Parse (Uri.Host), Uri.Port);
+        public bool IsIncoming { get; }
+        public int? ManualBytesReceived { get; set; }
+        public int? ManualBytesSent { get; set; }
+        public string Name => IsIncoming ? "Incoming" : "Outgoing";
+        public bool SlowConnection { get; set; }
+        public Uri Uri => new Uri ("ipv4://127.0.0.1:1234");
 
-        public event EventHandler BeginSendStarted;
-        public event EventHandler EndSendStarted;
+        public List<int> Receives { get; } = new List<int> ();
+        public List<int> Sends { get; } = new List<int> ();
 
-        private Socket s;
-        private bool incoming;
+        Stream ReadStream { get; }
+        Stream WriteStream { get; }
 
-        public int? ManualBytesReceived {
-            get; set;
-        }
+        /// <summary>
+        /// The speed monitor representing the TorrentManager this connection is associated with
+        /// </summary>
+        public ConnectionMonitor ManagerMonitor { get; } = new ConnectionMonitor ();
 
-        public int? ManualBytesSent {
-            get; set;
-        }
+        /// <summary>
+        /// The speed monitor representing this connection with this connection
+        /// </summary>
+        public ConnectionMonitor Monitor { get; } = new ConnectionMonitor ();
 
-        public bool SlowConnection {
-            get; set;
-        }
-
-        public CustomConnection(Socket s, bool incoming)
+        public CustomConnection (Stream readStream, Stream writeStream, bool isIncoming)
         {
-            this.s = s;
-            this.incoming = incoming;
+            ReadStream = readStream;
+            WriteStream = writeStream;
+            IsIncoming = isIncoming;
         }
 
-        public byte[] AddressBytes
+        public ReusableTask ConnectAsync ()
+            => throw new InvalidOperationException ();
+
+        public void Dispose ()
         {
-            get { return ((IPEndPoint)s.RemoteEndPoint).Address.GetAddressBytes(); }
+            ReadStream.Dispose ();
+            WriteStream.Dispose ();
+            Connected = false;
         }
 
-        public bool Connected
+        public async ReusableTask<int> ReceiveAsync (ByteBuffer buffer, int offset, int count)
         {
-            get { return s.Connected; }
-        }
-
-        public bool CanReconnect
-        {
-            get { return false; }
-        }
-
-        public bool IsIncoming
-        {
-            get { return incoming; }
-        }
-
-        public EndPoint EndPoint
-        {
-            get { return s.RemoteEndPoint; }
-        }
-
-        public IAsyncResult BeginConnect(AsyncCallback callback, object state)
-        {
-            throw new InvalidOperationException();
-        }
-
-        public void EndConnect(IAsyncResult result)
-        {
-            throw new InvalidOperationException();
-        }
-
-        public IAsyncResult BeginReceive(byte[] buffer, int offset, int count, AsyncCallback callback, object state)
-        {
-            if (BeginReceiveStarted != null)
-                BeginReceiveStarted (this, EventArgs.Empty);
             if (SlowConnection)
-                count = 1;
-            return s.BeginReceive(buffer, offset, count, SocketFlags.None, callback, state);
+                count = Math.Min (88, count);
+
+            var result = await ReadStream.ReadAsync (buffer.Data, offset, count, CancellationToken.None);
+            Receives.Add (result);
+            return ManualBytesReceived ?? result;
         }
 
-        public int EndReceive(IAsyncResult result)
+        public async ReusableTask<int> SendAsync (ByteBuffer buffer, int offset, int count)
         {
-            if (EndReceiveStarted != null)
-                EndReceiveStarted(null, EventArgs.Empty);
-
-            if (ManualBytesReceived.HasValue)
-                return ManualBytesReceived.Value;
-
-            try
-            {
-                return s.EndReceive(result);
-            }
-            catch (ObjectDisposedException)
-            {
-                return 0;
-            }
-        }
-
-        public IAsyncResult BeginSend(byte[] buffer, int offset, int count, AsyncCallback callback, object state)
-        {
-            if (BeginSendStarted != null)
-                BeginSendStarted(null, EventArgs.Empty);
-
             if (SlowConnection)
-                count = 1;
-            return s.BeginSend(buffer, offset, count, SocketFlags.None, callback, state);
+                count = Math.Min (88, count);
+
+            await WriteStream.WriteAsync (buffer.Data, offset, count, CancellationToken.None);
+            Sends.Add (count);
+            return ManualBytesSent ?? count;
         }
 
-        public int EndSend(IAsyncResult result)
-        {
-            if (EndSendStarted != null)
-                EndSendStarted(null, EventArgs.Empty);
-
-            if (ManualBytesSent.HasValue)
-                return ManualBytesSent.Value;
-
-            try
-            {
-                return s.EndSend(result);
-            }
-            catch (ObjectDisposedException)
-            {
-                return 0;
-            }
-        }
-        //private bool disposed;
-        public void Dispose()
-        {
-           // disposed = true;
-            s.Close();
-        }
-
-        public override string ToString()
-        {
-            return Name;
-        }
-
-        public Uri Uri
-        {
-            get { return new Uri("tcp://127.0.0.1:1234"); }
-        }
-
-
-        public int Receive (byte[] buffer, int offset, int count)
-        {
-            var r = BeginReceive (buffer, offset, count, null, null);
-            if (!r.AsyncWaitHandle.WaitOne (TimeSpan.FromSeconds (4)))
-                throw new Exception ("Could not receive required data");
-            return EndReceive (r);
-        }
-
-        public int Send (byte[] buffer, int offset, int count)
-        {
-            var r = BeginSend (buffer, offset, count, null, null);
-            if (!r.AsyncWaitHandle.WaitOne (TimeSpan.FromSeconds (4)))
-                throw new Exception ("Could not receive required data");
-            return EndSend (r);
-        }
+        public override string ToString ()
+            => Name;
     }
 
-    public class CustomListener : PeerListener
+    class CustomListener : IPeerListener
     {
-        public override void Start()
-        {
+        public event EventHandler<NewConnectionEventArgs> ConnectionReceived;
+        public event EventHandler<EventArgs> StatusChanged;
 
+        public ListenerStatus Status { get; private set; }
+
+        public void Start ()
+        {
+            Status = ListenerStatus.Listening;
+            StatusChanged?.Invoke (this, EventArgs.Empty);
         }
 
-        public override void Stop()
+        public void Stop ()
         {
-
+            Status = ListenerStatus.NotListening;
+            StatusChanged?.Invoke (this, EventArgs.Empty);
         }
 
-        public CustomListener()
-            :base(new IPEndPoint(IPAddress.Any, 0))
+        public void Add (TorrentManager manager, IConnection connection)
         {
-        }
-
-        public void Add(TorrentManager manager, IConnection connection)
-        {
-            MonoTorrent.Client.Peer p = new MonoTorrent.Client.Peer("", new Uri("tcp://12.123.123.1:2342"), EncryptionTypes.All);
-            base.RaiseConnectionReceived(p, connection, manager);
+            var p = new Peer ("", new Uri ("ipv4://12.123.123.1:2342"), EncryptionTypes.All);
+            ConnectionReceived?.Invoke (this, new NewConnectionEventArgs (p, connection, manager));
         }
     }
 
     public class ConnectionPair : IDisposable
     {
-        TcpListener socketListener;
-        public CustomConnection Incoming;
-        public CustomConnection Outgoing;
+        static readonly TimeSpan Timeout = System.Diagnostics.Debugger.IsAttached ? TimeSpan.FromHours (1) : TimeSpan.FromSeconds (5);
 
-        public ConnectionPair(int port)
+        IDisposable CancellationRegistration { get; set; }
+
+        public CustomConnection Incoming { get; }
+        public CustomConnection Outgoing { get; }
+
+        public ConnectionPair ()
         {
-            socketListener = new TcpListener(IPAddress.Loopback, port);
-            socketListener.Start();
-
-            Socket s1a = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-            s1a.Connect(IPAddress.Loopback, port);
-            Socket s1b = socketListener.AcceptSocket();
-
-            Incoming = new CustomConnection(s1a, true);
-            Outgoing = new CustomConnection(s1b, false);
-            socketListener.Stop();
+            var incoming = new SocketStream ();
+            var outgoing = new SocketStream ();
+            Incoming = new CustomConnection (incoming, outgoing, true);
+            Outgoing = new CustomConnection (outgoing, incoming, false);
         }
 
-        public void Dispose()
+        public void Dispose ()
         {
-            Incoming.Dispose();
-            Outgoing.Dispose();
-            socketListener.Stop();
+            CancellationRegistration?.Dispose ();
+            Incoming.Dispose ();
+            Outgoing.Dispose ();
+        }
+
+        public ConnectionPair WithTimeout ()
+        {
+            CancellationTokenSource cancellation = new CancellationTokenSource (Timeout);
+            CancellationRegistration = cancellation.Token.Register (Dispose);
+            return this;
         }
     }
 
-    public class TestRig : IDisposable
+    class TestRig : IDisposable
     {
-        static Random Random = new Random(1000);
+        static readonly Random Random = new Random (1000);
         static int port = 10000;
-        private BEncodedDictionary torrentDict;
-        private ClientEngine engine;
-        private CustomListener listener;
-        private TorrentManager manager;
-        private Torrent torrent;
 
-        public int BlocksPerPiece
-        {
-            get { return torrent.PieceLength / (16 * 1024); }
+        public int BlocksPerPiece {
+            get { return Torrent.PieceLength / (16 * 1024); }
         }
 
-        public int Pieces
-        {
-            get { return torrent.Pieces.Count; }
+        public int Pieces {
+            get { return Torrent.Pieces.Count; }
         }
 
-        public int TotalBlocks
-        {
-            get
-            {
+        public int TotalBlocks {
+            get {
                 int count = 0;
-                long size = torrent.Size;
-                while (size > 0)
-                {
+                long size = Torrent.Size;
+                while (size > 0) {
                     count++;
                     size -= Piece.BlockSize;
                 }
@@ -359,20 +310,11 @@ namespace MonoTorrent.Client
             get; set;
         }
 
-        public ClientEngine Engine
-        {
-            get { return engine; }
-        }
+        public ClientEngine Engine { get; }
 
-        public CustomListener Listener
-        {
-            get { return listener; }
-        }
+        public CustomListener Listener { get; }
 
-        public TorrentManager Manager
-        {
-            get { return manager; }
-        }
+        public TorrentManager Manager { get; set; }
 
         public bool MetadataMode {
             get; private set;
@@ -382,80 +324,67 @@ namespace MonoTorrent.Client
             get; set;
         }
 
-        public Torrent Torrent
+        public Torrent Torrent { get; set; }
+
+        public BEncodedDictionary TorrentDict { get; set; }
+
+        readonly string savePath;
+        readonly int piecelength;
+        readonly string[][] tier;
+
+        public void AddConnection (IConnection connection)
         {
-            get { return torrent; }
+            Listener.Add (connection.IsIncoming ? null : Manager, connection);
+        }
+        public PeerId CreatePeer (bool processingQueue)
+        {
+            return CreatePeer (processingQueue, true);
         }
 
-        public BEncodedDictionary TorrentDict
+        public PeerId CreatePeer (bool processingQueue, bool supportsFastPeer)
         {
-            get { return torrentDict; }
-        }
-
-        public CustomTracker Tracker
-        {
-            get { return (CustomTracker)this.manager.TrackerManager.CurrentTracker; }
-        }
-
-
-        string savePath; int piecelength; string[][] tier;
-
-        public void AddConnection(IConnection connection)
-        {
-            if (connection.IsIncoming)
-                listener.Add(null, connection);
-            else
-                listener.Add(manager, connection);
-        }
-        public PeerId CreatePeer(bool processingQueue)
-        {
-            return CreatePeer(processingQueue, true);
-        }
-
-        public PeerId CreatePeer(bool processingQueue, bool supportsFastPeer)
-        {
-            StringBuilder sb = new StringBuilder();
+            StringBuilder sb = new StringBuilder ();
             for (int i = 0; i < 20; i++)
-                sb.Append((char)Random.Next((int)'a', (int)'z'));
-            Peer peer = new Peer(sb.ToString(), new Uri("tcp://127.0.0.1:" + (port++)));
-            PeerId id = new PeerId(peer, Manager);
+                sb.Append ((char) Random.Next ('a', 'z'));
+            Peer peer = new Peer (sb.ToString (), new Uri ($"ipv4://127.0.0.1:{(port++)}"));
+            PeerId id = new PeerId (peer, NullConnection.Incoming, Manager.Bitfield?.Clone ().SetAll (false));
             id.SupportsFastPeer = supportsFastPeer;
-            id.ProcessingQueue = processingQueue;
+            id.MessageQueue.SetReady ();
+            if (processingQueue)
+                id.MessageQueue.BeginProcessing (force: true);
             return id;
         }
 
-        public void Dispose()
+        public void Dispose ()
         {
-            engine.Dispose();
+            Engine.Dispose ();
         }
 
-        public void RecreateManager()
+        public async Task RecreateManager ()
         {
-            if (manager != null)
-            {
-                manager.Dispose();
-                if (engine.Contains(manager))
-                    engine.Unregister(manager);
+            if (Manager != null) {
+                Manager.Dispose ();
+                if (Engine.Contains (Manager))
+                    await Engine.Unregister (Manager);
             }
-            torrentDict = CreateTorrent(piecelength, files, tier);
-            torrent = Torrent.Load(torrentDict);
-            if (MetadataMode)
-                manager = new TorrentManager(torrent.infoHash, savePath, new TorrentSettings(), MetadataPath, new RawTrackerTiers ());
-            else
-                manager = new TorrentManager(torrent, savePath, new TorrentSettings());
-            engine.Register(manager);
+            TorrentDict = CreateTorrent (piecelength, files, tier);
+            Torrent = Torrent.Load (TorrentDict);
+            Manager = MetadataMode
+                ? new TorrentManager (Torrent.InfoHash, savePath, new TorrentSettings (), MetadataPath, tier)
+                : new TorrentManager (Torrent, savePath, new TorrentSettings ());
+            await Engine.Register (Manager);
         }
 
         #region Rig Creation
 
-        TorrentFile[] files;
-        TestRig(string savePath, int piecelength, TestWriter writer, string[][] trackers, TorrentFile[] files)
+        readonly TorrentFile[] files;
+        TestRig (string savePath, int piecelength, TestWriter writer, string[][] trackers, TorrentFile[] files)
             : this (savePath, piecelength, writer, trackers, files, false)
         {
-            
+
         }
 
-        TestRig(string savePath, int piecelength, TestWriter writer, string[][] trackers, TorrentFile[] files, bool metadataMode)
+        TestRig (string savePath, int piecelength, TestWriter writer, string[][] trackers, TorrentFile[] files, bool metadataMode)
         {
             this.files = files;
             this.savePath = savePath;
@@ -463,112 +392,120 @@ namespace MonoTorrent.Client
             this.tier = trackers;
             MetadataMode = metadataMode;
             MetadataPath = "metadataSave.torrent";
-            listener = new CustomListener();
-            engine = new ClientEngine(new EngineSettings(), listener, writer);
+            Listener = new CustomListener ();
+            Engine = new ClientEngine (new EngineSettings (), Listener, writer);
+            Engine.RegisterLocalPeerDiscovery (new ManualLocalPeerListener ());
             Writer = writer;
 
-            RecreateManager();
+            RecreateManager ().Wait ();
         }
 
-        static TestRig()
+        static TestRig ()
         {
-            TrackerFactory.Register("custom", typeof(CustomTracker));
+            TrackerFactory.Register ("custom", uri => new CustomTracker (uri));
         }
 
-        private static void AddAnnounces(BEncodedDictionary dict, string[][] tiers)
+        private static void AddAnnounces (BEncodedDictionary dict, string[][] tiers)
         {
-            BEncodedList announces = new BEncodedList();
-            foreach (string[] tier in tiers)
-            {
-                BEncodedList bTier = new BEncodedList();
-                announces.Add(bTier);
+            BEncodedList announces = new BEncodedList ();
+            foreach (string[] tier in tiers) {
+                BEncodedList bTier = new BEncodedList ();
+                announces.Add (bTier);
                 foreach (string s in tier)
-                    bTier.Add((BEncodedString)s);
+                    bTier.Add ((BEncodedString) s);
             }
-            dict["announce"] = (BEncodedString)tiers[0][0];
+            dict["announce"] = (BEncodedString) tiers[0][0];
             dict["announce-list"] = announces;
         }
 
-        BEncodedDictionary CreateTorrent(int pieceLength, TorrentFile[] files, string[][] tier)
+        static BEncodedDictionary CreateTorrent (int pieceLength, TorrentFile[] files, string[][] tier)
         {
-            BEncodedDictionary dict = new BEncodedDictionary();
-            BEncodedDictionary infoDict = new BEncodedDictionary();
+            BEncodedDictionary dict = new BEncodedDictionary ();
+            BEncodedDictionary infoDict = new BEncodedDictionary ();
 
-            AddAnnounces(dict, tier);
-            AddFiles(infoDict, files);
-            if (files.Length == 1)
-                dict["url-list"] = (BEncodedString)"http://127.0.0.1:120/announce/File1.exe";
-            else
-                dict["url-list"] = (BEncodedString)"http://127.0.0.1:120/announce";
-            dict["creation date"] = (BEncodedNumber)(int)(DateTime.Now - new DateTime(1970, 1, 1)).TotalSeconds;
-            dict["encoding"] = (BEncodedString)"UTF-8";
+            if (tier != null)
+                AddAnnounces (dict, tier);
+
+            AddFiles (infoDict, files, pieceLength);
+            dict["creation date"] = (BEncodedNumber) (int) (DateTime.Now - new DateTime (1970, 1, 1)).TotalSeconds;
+            dict["encoding"] = (BEncodedString) "UTF-8";
             dict["info"] = infoDict;
 
             return dict;
         }
 
-        void AddFiles(BEncodedDictionary dict, TorrentFile[] files)
+        internal static Torrent CreateMultiFileTorrent (TorrentFile[] files, int pieceLength)
+            => CreateMultiFileTorrent (files, pieceLength, out BEncodedDictionary _);
+
+        internal static Torrent CreateMultiFileTorrent (TorrentFile[] files, int pieceLength, out BEncodedDictionary torrentInfo)
         {
-            long totalSize = piecelength - 1;
-            BEncodedList bFiles = new BEncodedList();
-            for (int i = 0; i < files.Length; i++)
-            {
-                BEncodedList path = new BEncodedList();
-                foreach (string s in files[i].Path.Split('/'))
-                    path.Add((BEncodedString)s);
-                BEncodedDictionary d = new BEncodedDictionary();
-                d["path"] = path;
-                d["length"] = (BEncodedNumber)files[i].Length;
-                bFiles.Add(d);
+            using var rig = CreateMultiFile (files, pieceLength);
+            torrentInfo = rig.TorrentDict;
+            return rig.Torrent;
+        }
+
+        static void AddFiles (BEncodedDictionary dict, TorrentFile[] files, int pieceLength)
+        {
+            long totalSize = pieceLength - 1;
+            var bFiles = new BEncodedList ();
+            for (int i = 0; i < files.Length; i++) {
+                var path = new BEncodedList ();
+                foreach (string s in files[i].Path.Split ('/'))
+                    path.Add ((BEncodedString) s);
+                var d = new BEncodedDictionary {
+                    ["path"] = path,
+                    ["length"] = (BEncodedNumber) files[i].Length
+                };
+                bFiles.Add (d);
                 totalSize += files[i].Length;
             }
 
-            dict[new BEncodedString("files")] = bFiles;
-            dict[new BEncodedString("name")] = new BEncodedString("test.files");
-            dict[new BEncodedString("piece length")] = new BEncodedNumber(piecelength);
-            dict[new BEncodedString("pieces")] = new BEncodedString(new byte[20 * (totalSize / piecelength)]);
+            dict[new BEncodedString ("files")] = bFiles;
+            dict[new BEncodedString ("name")] = new BEncodedString ("test.files");
+            dict[new BEncodedString ("piece length")] = new BEncodedNumber (pieceLength);
+            dict[new BEncodedString ("pieces")] = new BEncodedString (new byte[20 * (totalSize / pieceLength)]);
         }
 
-        public static TestRig CreateSingleFile()
+        public static TestRig CreateSingleFile ()
         {
-            return new TestRig("", StandardPieceSize(), StandardWriter(), StandardTrackers(), StandardSingleFile());
+            return new TestRig ("", StandardPieceSize (), StandardWriter (), StandardTrackers (), StandardSingleFile ());
         }
 
-        public static TestRig CreateMultiFile()
+        public static TestRig CreateMultiFile ()
         {
-            return new TestRig("", StandardPieceSize(), StandardWriter(), StandardTrackers(), StandardMultiFile());
+            return new TestRig ("", StandardPieceSize (), StandardWriter (), StandardTrackers (), StandardMultiFile ());
         }
 
-        internal static TestRig CreateMultiFile(TorrentFile[] files, int pieceLength)
+        internal static TestRig CreateMultiFile (TorrentFile[] files, int pieceLength)
         {
-            return new TestRig("", pieceLength, StandardWriter(), StandardTrackers(), files);
+            return new TestRig ("", pieceLength, StandardWriter (), StandardTrackers (), files);
         }
 
-        public static TestRig CreateTrackers(string[][] tier)
+        public static TestRig CreateTrackers (string[][] tier)
         {
-            return new TestRig("", StandardPieceSize(), StandardWriter(), tier, StandardMultiFile());
+            return new TestRig ("", StandardPieceSize (), StandardWriter (), tier, StandardMultiFile ());
         }
 
-        internal static TestRig CreateMultiFile(TestWriter writer)
+        internal static TestRig CreateMultiFile (TestWriter writer)
         {
-            return new TestRig ("", StandardPieceSize (), writer, StandardTrackers (), StandardMultiFile());
+            return new TestRig ("", StandardPieceSize (), writer, StandardTrackers (), StandardMultiFile ());
         }
 
-        internal static TestRig CreateMultiFile(int pieceSize)
+        internal static TestRig CreateMultiFile (int pieceSize)
         {
-            return new TestRig("", pieceSize, StandardWriter(), StandardTrackers(), StandardMultiFile());
+            return new TestRig ("", pieceSize, StandardWriter (), StandardTrackers (), StandardMultiFile ());
         }
 
         #region Create standard fake data
 
-        static int StandardPieceSize()
+        static int StandardPieceSize ()
         {
             return 256 * 1024;
         }
 
-        static TorrentFile[] StandardMultiFile()
+        static TorrentFile[] StandardMultiFile ()
         {
-            return new TorrentFile[] {
+            return new[] {
                 new TorrentFile ("Dir1/File1", (int)(StandardPieceSize () * 0.44)),
                 new TorrentFile ("Dir1/Dir2/File2", (int)(StandardPieceSize () * 13.25)),
                 new TorrentFile ("File3", (int)(StandardPieceSize () * 23.68)),
@@ -576,40 +513,71 @@ namespace MonoTorrent.Client
             };
         }
 
-        static TorrentFile[] StandardSingleFile()
+        static TorrentFile[] StandardSingleFile ()
         {
-            return new TorrentFile[] {
+            return new[] {
                  new TorrentFile ("Dir1/File1", (int)(StandardPieceSize () * 0.44))
             };
         }
 
-        static string[][] StandardTrackers()
+        static string[][] StandardTrackers ()
         {
-            return new string[][] {
-                new string[] { "custom://tier1/announce1", "custom://tier1/announce2" },
-                new string[] { "custom://tier2/announce1", "custom://tier2/announce2", "custom://tier2/announce3" },
+            return new[] {
+                new[] { "custom://tier1/announce1", "custom://tier1/announce2" },
+                new[] { "custom://tier2/announce1", "custom://tier2/announce2", "custom://tier2/announce3" },
             };
         }
 
-        static TestWriter StandardWriter()
+        static TestWriter StandardWriter ()
         {
-            return new TestWriter();
+            return new TestWriter ();
         }
 
         #endregion Create standard fake data
 
         #endregion Rig Creation
 
-        internal static TestRig CreateSingleFile(int torrentSize, int pieceLength)
+        internal static TorrentManager CreatePrivate ()
         {
-            return CreateSingleFile(torrentSize, pieceLength, false);
+            var dict = CreateTorrent (16 * 1024 * 8, new[] { new TorrentFile ("File", 16 * 1024 * 8) }, null);
+            var editor = new TorrentEditor (dict) {
+                CanEditSecureMetadata = true,
+                Private = true,
+            };
+            return new TorrentManager (editor.ToTorrent (), "", new TorrentSettings ());
         }
 
-        internal static TestRig CreateSingleFile(int torrentSize, int pieceLength, bool metadataMode)
+        internal static TestRig CreateSingleFile (long torrentSize, int pieceLength)
         {
-            TorrentFile[] files = StandardSingleFile();
+            return CreateSingleFile (torrentSize, pieceLength, false);
+        }
+
+        internal static TestRig CreateSingleFile (long torrentSize, int pieceLength, bool metadataMode)
+        {
+            TorrentFile[] files = StandardSingleFile ();
             files[0] = new TorrentFile (files[0].Path, torrentSize);
-            return new TestRig("", pieceLength, StandardWriter(), StandardTrackers(), files, metadataMode);
+            return new TestRig ("", pieceLength, StandardWriter (), StandardTrackers (), files, metadataMode);
+        }
+
+        internal static TestRig CreateMultiFile (int pieceLength, bool metadataMode)
+        {
+            return new TestRig ("", pieceLength, StandardWriter (), StandardTrackers (), StandardMultiFile (), metadataMode);
+        }
+
+        internal static TorrentManager CreateSingleFileManager (long torrentSize, int pieceLength)
+        {
+            return CreateSingleFile (torrentSize, pieceLength, false).Manager;
+        }
+
+        internal static TorrentManager CreateMultiFileManager (int[] fileSizes, int pieceLength)
+        {
+            var files = fileSizes.Select ((size, index) => new TorrentFile ($"File {index}", size)).ToArray ();
+            return CreateMultiFileManager (files, pieceLength);
+        }
+
+        internal static TorrentManager CreateMultiFileManager (TorrentFile[] files, int pieceLength)
+        {
+            return CreateMultiFile (files, pieceLength).Manager;
         }
     }
 }

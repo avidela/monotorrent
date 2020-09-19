@@ -27,177 +27,127 @@
 //
 
 
-
 using System;
 using System.Collections.Generic;
-using MonoTorrent.Common;
-using MonoTorrent.Client;
-using System.Threading;
-using MonoTorrent.Client.Messages.Standard;
-using MonoTorrent.Client.Messages.FastPeer;
-using MonoTorrent.Client.Messages;
+using System.Linq;
+using System.Threading.Tasks;
+
 using MonoTorrent.Client.Connections;
+using MonoTorrent.Client.Messages;
+using MonoTorrent.Client.Messages.Standard;
+using MonoTorrent.Client.PiecePicking;
 
 namespace MonoTorrent.Client
 {
     /// <summary>
     /// Contains the logic for choosing what piece to download next
     /// </summary>
-    public class PieceManager 
+    public class PieceManager
     {
         #region Old
-        // For every 10 kB/sec upload a peer has, we request one extra piece above the standard amount him
-        internal const int BonusRequestPerKb = 10;  
-        internal const int NormalRequestAmount = 2;
-        internal const int MaxEndGameRequests = 2;
+        // For every 10 kB/sec upload a peer has, we request one extra piece above the standard amount
+        internal const int BonusRequestPerKb = 10;
+        // Default to a minimum of 8 blocks
+        internal const int NormalRequestAmount = 8;
+        // Allow 4 pending blocks per peer during end game
+        internal const int MaxEndGameRequests = 4;
 
         public event EventHandler<BlockEventArgs> BlockReceived;
         public event EventHandler<BlockEventArgs> BlockRequested;
         public event EventHandler<BlockEventArgs> BlockRequestCancelled;
 
-        internal void RaiseBlockReceived(BlockEventArgs args)
+        internal void RaiseBlockReceived (BlockEventArgs args)
         {
-            Toolbox.RaiseAsyncEvent<BlockEventArgs>(BlockReceived, args.TorrentManager, args);
+            BlockReceived?.InvokeAsync (args.TorrentManager, args);
         }
 
-        internal void RaiseBlockRequested(BlockEventArgs args)
+        internal void RaiseBlockRequested (BlockEventArgs args)
         {
-            Toolbox.RaiseAsyncEvent<BlockEventArgs>(BlockRequested, args.TorrentManager, args);
+            BlockRequested?.InvokeAsync (args.TorrentManager, args);
         }
 
-        internal void RaiseBlockRequestCancelled(BlockEventArgs args)
+        internal void RaiseBlockRequestCancelled (BlockEventArgs args)
         {
-            Toolbox.RaiseAsyncEvent<BlockEventArgs>(BlockRequestCancelled, args.TorrentManager, args);
+            BlockRequestCancelled?.InvokeAsync (args.TorrentManager, args);
         }
 
         #endregion Old
 
-        PiecePicker picker;
-        BitField unhashedPieces;
+        TorrentManager Manager { get; }
+        PiecePicker originalPicker;
+        internal PiecePicker Picker { get; private set; }
+        internal BitField PendingHashCheckPieces { get; private set; }
 
-        internal PiecePicker Picker
+        internal PieceManager (TorrentManager manager)
         {
-            get { return picker; }
+            Manager = manager;
+            Picker = new NullPicker ();
+            PendingHashCheckPieces = new BitField (1);
         }
 
-        internal BitField UnhashedPieces
+        internal Piece PieceDataReceived (PeerId id, PieceMessage message)
         {
-            get { return unhashedPieces; }
-        }
+            if (Picker.ValidatePiece (id, message.PieceIndex, message.StartOffset, message.RequestLength, out Piece piece)) {
+                id.LastBlockReceived.Restart ();
+                Block block = piece.Blocks[message.StartOffset / Piece.BlockSize];
 
-        internal PieceManager()
-        {
-            picker = new NullPicker();
-            unhashedPieces = new BitField(0);
-        }
+                if (BlockReceived != null)
+                    RaiseBlockReceived (new BlockEventArgs (Manager, block, piece, id));
 
-        public void PieceDataReceived(PeerId peer, PieceMessage message)
-        {
-            Piece piece;
-            if (picker.ValidatePiece(peer, message.PieceIndex, message.StartOffset, message.RequestLength, out piece))
-            {
-                PeerId id = peer;
-                TorrentManager manager = id.TorrentManager;
-                Block block = piece.Blocks [message.StartOffset / Piece.BlockSize];
-                long offset = (long) message.PieceIndex * id.TorrentManager.Torrent.PieceLength + message.StartOffset;
-
-                id.LastBlockReceived = DateTime.Now;
-                id.TorrentManager.PieceManager.RaiseBlockReceived(new BlockEventArgs(manager, block, piece, id));
-				id.TorrentManager.Engine.DiskManager.QueueWrite (manager, offset, message.Data, message.RequestLength , delegate {
-                    piece.Blocks[message.StartOffset/ Piece.BlockSize].Written = true;
-                    ClientEngine.BufferManager.FreeBuffer(ref message.Data);
-					// If we haven't written all the pieces to disk, there's no point in hash checking
-					if (!piece.AllBlocksWritten)
-						return;
-
-					// Hashcheck the piece as we now have all the blocks.
-                    id.Engine.DiskManager.BeginGetHash (id.TorrentManager, piece.Index, delegate (object o) {
-					    byte[] hash = (byte[]) o;
-					    bool result = hash == null ? false : id.TorrentManager.Torrent.Pieces.IsValid(hash, piece.Index);
-					    id.TorrentManager.Bitfield[message.PieceIndex] = result;
-
-					    ClientEngine.MainLoop.Queue(delegate
-					    {
-						    id.TorrentManager.PieceManager.UnhashedPieces[piece.Index] = false;
-
-						    id.TorrentManager.HashedPiece(new PieceHashedEventArgs(id.TorrentManager, piece.Index, result));
-						    List<PeerId> peers = new List<PeerId>(piece.Blocks.Length);
-						    for (int i = 0; i < piece.Blocks.Length; i++)
-							    if (piece.Blocks[i].RequestedOff != null && !peers.Contains(piece.Blocks[i].RequestedOff))
-								    peers.Add(piece.Blocks[i].RequestedOff);
-
-						    for (int i = 0; i < peers.Count; i++) {
-							    if (peers[i].Connection != null) {
-								    peers[i].Peer.HashedPiece(result);
-									if (peers [i].Peer.TotalHashFails == 5)
-										peers[i].ConnectionManager.CleanupSocket (id, "Too many hash fails");
-								}
-							}
-
-						    // If the piece was successfully hashed, enqueue a new "have" message to be sent out
-						    if (result)
-							    id.TorrentManager.finishedPieces.Enqueue(piece.Index);
-					    });
-					});
-				});
-                
                 if (piece.AllBlocksReceived)
-                    this.unhashedPieces[message.PieceIndex] = true;
+                    PendingHashCheckPieces[message.PieceIndex] = true;
+                return piece;
             }
-            else
-            {
-            }
+            return null;
         }
 
-        internal void AddPieceRequests(PeerId id)
+        internal void AddPieceRequests (PeerId id)
         {
-            PeerMessage msg = null;
             int maxRequests = id.MaxPendingRequests;
 
             if (id.AmRequestingPiecesCount >= maxRequests)
                 return;
 
             int count = 1;
-            if (id.Connection is HttpConnection)
-            {
+            if (id.Connection is HttpConnection) {
+                if (id.AmRequestingPiecesCount > 0)
+                    return;
+
                 // How many whole pieces fit into 2MB
-                count = (2 * 1024 * 1024) / id.TorrentManager.Torrent.PieceLength;
+                count = (2 * 1024 * 1024) / Manager.Torrent.PieceLength;
 
                 // Make sure we have at least one whole piece
-                count = Math.Max(count, 1);
-                
-                count *= id.TorrentManager.Torrent.PieceLength / Piece.BlockSize;
+                count = Math.Max (count, 1);
+
+                count *= Manager.Torrent.PieceLength / Piece.BlockSize;
             }
 
-            if (!id.IsChoking || id.SupportsFastPeer)
-            {
-                while (id.AmRequestingPiecesCount < maxRequests)
-                {
-                    msg = Picker.ContinueExistingRequest(id);
-                    if (msg != null)
-                        id.Enqueue(msg);
+            if (!id.IsChoking || id.SupportsFastPeer) {
+                while (id.AmRequestingPiecesCount < maxRequests) {
+                    PieceRequest request = Picker.ContinueExistingRequest (id);
+                    if (request != null)
+                        id.MessageQueue.Enqueue (new RequestMessage (request.PieceIndex, request.StartOffset, request.RequestLength));
                     else
                         break;
-                } 
+                }
             }
 
-            if (!id.IsChoking || (id.SupportsFastPeer && id.IsAllowedFastPieces.Count > 0))
-            {
-                while (id.AmRequestingPiecesCount < maxRequests)
-                {
-                    msg = Picker.PickPiece(id, id.TorrentManager.Peers.ConnectedPeers, count);
-                    if (msg != null)
-                        id.Enqueue(msg);
+            if (!id.IsChoking || (id.SupportsFastPeer && id.IsAllowedFastPieces.Count > 0)) {
+                while (id.AmRequestingPiecesCount < maxRequests) {
+                    List<PeerId> otherPeers = Manager.Peers.ConnectedPeers ?? new List<PeerId> ();
+                    IList<PieceRequest> request = Picker.PickPiece (id, id.BitField, otherPeers, count);
+                    if (request != null && request.Count > 0)
+                        id.MessageQueue.Enqueue (new RequestBundle (request));
                     else
                         break;
                 }
             }
         }
 
-        internal bool IsInteresting(PeerId id)
+        internal bool IsInteresting (PeerId id)
         {
             // If i have completed the torrent, then no-one is interesting
-            if (id.TorrentManager.Complete)
+            if (Manager.Complete)
                 return false;
 
             // If the peer is a seeder, then he is definately interesting
@@ -205,31 +155,47 @@ namespace MonoTorrent.Client
                 return true;
 
             // Otherwise we need to do a full check
-            return Picker.IsInteresting(id.BitField);
+            return Picker.IsInteresting (id.BitField);
         }
 
-        internal void ChangePicker(PiecePicker picker, BitField bitfield, TorrentFile[] files)
+        internal void ChangePicker (PiecePicker picker, BitField bitfield)
         {
-            if (unhashedPieces.Length != bitfield.Length)
-                unhashedPieces = new BitField(bitfield.Length);
+            originalPicker = picker;
+            if (PendingHashCheckPieces.Length != bitfield.Length)
+                PendingHashCheckPieces = new BitField (bitfield.Length);
 
-            picker = new IgnoringPicker(bitfield, picker);
-            picker = new IgnoringPicker(unhashedPieces, picker);
-            IEnumerable<Piece> pieces = Picker == null ? new List<Piece>() : Picker.ExportActiveRequests();
-            picker.Initialise(bitfield, files, pieces);
-            this.picker = picker;
+            // 'PendingHashCheckPieces' is the list of fully downloaded pieces which
+            // are waiting to be hash checked. We should not begin a second download of
+            // a piece while waiting to confirm if the original download was successful.
+            //
+            // 'Manager.UnhashedPieces' represents the pieces from the torrent which
+            // have not been hash checked as they are marked as 'DoNotDownload'. If
+            // a file is changed to be downloadable, the engine will hashcheck the data
+            // first and then remove them from the 'UnhashedPieces' bitfield which will
+            // make them downloadable. If they actually passed the hashcheck then they
+            // won't actually be requested again.
+            picker = new IgnoringPicker (bitfield, picker);
+            picker = new IgnoringPicker (PendingHashCheckPieces, picker);
+            picker = new IgnoringPicker (Manager.UnhashedPieces, picker);
+            Picker = picker;
         }
 
-        internal void Reset()
+        internal void RefreshPickerWithMetadata (BitField bitfield, ITorrentData data)
         {
-            this.unhashedPieces.SetAll(false);
-            if (picker != null)
-                picker.Reset();
+            ChangePicker (originalPicker, bitfield);
+            Picker.Initialise (bitfield, data, Enumerable.Empty<Piece> ());
         }
 
-        internal int CurrentRequestCount()
+        internal void Reset ()
         {
-            return (int)ClientEngine.MainLoop.QueueWait((MainLoopJob) delegate { return Picker.CurrentRequestCount(); });
+            PendingHashCheckPieces.SetAll (false);
+            Picker?.Reset ();
+        }
+
+        public async Task<int> CurrentRequestCountAsync ()
+        {
+            await ClientEngine.MainLoop;
+            return Picker.CurrentRequestCount ();
         }
     }
 }
